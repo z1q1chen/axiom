@@ -47,6 +47,9 @@ pub struct CodeGen<'a> {
     globals: HashSet<String>,
     scopes: Vec<HashSet<String>>,
     tmp: usize,
+    // Separate compilation: generated functions and invariant
+    // checkers get external linkage so modules can link.
+    pub separate: bool,
 }
 
 impl<'a> CodeGen<'a> {
@@ -61,7 +64,12 @@ impl<'a> CodeGen<'a> {
             globals: tp.globals.iter().map(|g| g.name.clone()).collect(),
             scopes: Vec::new(),
             tmp: 0,
+            separate: false,
         }
+    }
+
+    fn link_prefix(&self) -> &'static str {
+        if self.separate { "" } else { "static " }
     }
 
     fn fresh(&mut self) -> usize {
@@ -102,6 +110,46 @@ impl<'a> CodeGen<'a> {
         out
     }
 
+    fn gen_inv_checker(&mut self, s: &TStruct) -> String {
+        let mut out = format!(
+            "{}void ax_check_inv_{}(AxVal self) {{\n",
+            self.link_prefix(),
+            s.name
+        );
+        for (i, (fname, _)) in s.fields.iter().enumerate() {
+            out.push_str(&format!(
+                "    AxVal f_{} = ax_obj_get(self, {});\n",
+                fname, i
+            ));
+        }
+        for inv in &s.invariants {
+            let cond = self.gen_expr(&inv.expr, Ctx::Invariant);
+            out.push_str(&format!(
+                "    if (!ax_truth({})) ax_contract_fail(\"invariant\", \"{}\", \"{}\", \"{}\", {});\n",
+                cond,
+                c_escape(&s.name),
+                c_escape(&inv.text),
+                c_escape(&inv.file),
+                inv.line
+            ));
+        }
+        out.push_str("}\n\n");
+        out
+    }
+
+    fn fn_prototype(f: &TFn, prefix: &str) -> String {
+        let params = (0..f.params.len())
+            .map(|_| "AxVal")
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{}AxVal axf_{}({});\n",
+            prefix,
+            f.name,
+            if params.is_empty() { "void".to_string() } else { params }
+        )
+    }
+
     // Everything except the entry point: runtime, invariant
     // checkers, prototypes, globals, function bodies.
     fn gen_core(&mut self, tp: &TProgram) -> String {
@@ -114,41 +162,13 @@ impl<'a> CodeGen<'a> {
             if s.invariants.is_empty() {
                 continue;
             }
-            out.push_str(&format!(
-                "static void ax_check_inv_{}(AxVal self) {{\n",
-                s.name
-            ));
-            for (i, (fname, _)) in s.fields.iter().enumerate() {
-                out.push_str(&format!(
-                    "    AxVal f_{} = ax_obj_get(self, {});\n",
-                    fname, i
-                ));
-            }
-            for inv in &s.invariants {
-                let cond = self.gen_expr(&inv.expr, Ctx::Invariant);
-                out.push_str(&format!(
-                    "    if (!ax_truth({})) ax_contract_fail(\"invariant\", \"{}\", \"{}\", \"{}\", {});\n",
-                    cond,
-                    c_escape(&s.name),
-                    c_escape(&inv.text),
-                    c_escape(&inv.file),
-                    inv.line
-                ));
-            }
-            out.push_str("}\n\n");
+            let checker = self.gen_inv_checker(s);
+            out.push_str(&checker);
         }
 
         // Function prototypes.
         for f in &tp.fns {
-            let params = (0..f.params.len())
-                .map(|_| "AxVal")
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!(
-                "static AxVal axf_{}({});\n",
-                f.name,
-                if params.is_empty() { "void".to_string() } else { params }
-            ));
+            out.push_str(&Self::fn_prototype(f, "static "));
         }
         // Native prototypes for extern bindings (implemented by
         // the runtime section above).
@@ -192,7 +212,8 @@ impl<'a> CodeGen<'a> {
         self.scopes.push(param_scope);
         let mut out = String::new();
         out.push_str(&format!(
-            "static AxVal axf_{}({}) {{\n",
+            "{}AxVal axf_{}({}) {{\n",
+            self.link_prefix(),
             f.name,
             if params.is_empty() { "void".to_string() } else { params.join(", ") }
         ));
@@ -860,5 +881,129 @@ impl<'a> CodeGen<'a> {
         );
         out.push_str("    printf(\"VERIFY OK (bounded)\\n\");\n    return 0;\n}\n");
         out
+    }
+}
+
+/* ===== separate compilation (axiomc build --separate) =====
+   One C file per Axiom source file, compiled to separate
+   objects and linked. Every module carries its own private copy
+   of the runtime helpers (they are stateless; values are plain
+   malloc'd memory, so copies interoperate), while generated
+   functions, invariant checkers, and globals get external
+   linkage through a shared header. The checker still runs on
+   the whole program: module interfaces are the checked program
+   itself, not per-module signatures. */
+
+pub struct ModuleOut {
+    pub stem: String,
+    pub source: String,
+}
+
+fn module_stem(file: &str) -> String {
+    let mut s: String = file
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if s.ends_with("_ax") {
+        s.truncate(s.len() - 3);
+    }
+    s
+}
+
+const RUNTIME_SPLIT: &str = "static void *ax_alloc";
+
+impl<'a> CodeGen<'a> {
+    pub fn gen_header(&mut self, tp: &TProgram) -> String {
+        let prefix = RUNTIME.split(RUNTIME_SPLIT).next().unwrap();
+        let mut out = String::new();
+        out.push_str("#pragma once\n");
+        out.push_str(prefix);
+        out.push_str("/* ===== axiom generated declarations ===== */\n");
+        for f in &tp.fns {
+            out.push_str(&Self::fn_prototype(f, ""));
+        }
+        for s in self.structs.iter() {
+            if !s.invariants.is_empty() {
+                out.push_str(&format!("void ax_check_inv_{}(AxVal self);\n", s.name));
+            }
+        }
+        for g in &tp.globals {
+            out.push_str(&format!("extern AxVal g_{};\n", g.name));
+        }
+        out
+    }
+
+    pub fn gen_modules(&mut self, tp: &TProgram, entry_file: &str) -> Vec<ModuleOut> {
+        let (_, runtime_body) = RUNTIME.split_once(RUNTIME_SPLIT).unwrap();
+        let runtime_body = format!("{}{}", RUNTIME_SPLIT, runtime_body);
+        let structs = self.structs;
+        let mut files: Vec<String> = vec![entry_file.to_string()];
+        for f in &tp.fns {
+            if !files.contains(&f.file) {
+                files.push(f.file.clone());
+            }
+        }
+        for s in structs.iter() {
+            if !files.contains(&s.file) {
+                files.push(s.file.clone());
+            }
+        }
+        let mut used: HashSet<String> = HashSet::new();
+        let mut modules = Vec::new();
+        for file in &files {
+            let mut stem = module_stem(file);
+            if used.contains(&stem) {
+                let mut i = 2;
+                while used.contains(&format!("{}_{}", stem, i)) {
+                    i += 1;
+                }
+                stem = format!("{}_{}", stem, i);
+            }
+            used.insert(stem.clone());
+            let mut src = String::new();
+            src.push_str("#include \"axiom_gen.h\"\n");
+            src.push_str(&runtime_body);
+            src.push_str("\n/* ===== generated by axiomc (separate) ===== */\n");
+            for s in structs.iter() {
+                if s.file == *file && !s.invariants.is_empty() {
+                    let c = self.gen_inv_checker(s);
+                    src.push_str(&c);
+                }
+            }
+            for f in &tp.fns {
+                if f.file == *file && f.is_extern {
+                    let params = (0..f.params.len())
+                        .map(|_| "AxVal")
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    src.push_str(&format!(
+                        "static AxVal axn_{}({});\n",
+                        f.name,
+                        if params.is_empty() { "void".to_string() } else { params }
+                    ));
+                }
+            }
+            if file == entry_file {
+                for g in &tp.globals {
+                    src.push_str(&format!("AxVal g_{};\n", g.name));
+                }
+            }
+            for f in &tp.fns {
+                if f.file == *file {
+                    src.push_str(&self.gen_fn(f));
+                    src.push('\n');
+                }
+            }
+            if file == entry_file {
+                src.push_str("int main(void) {\n");
+                for g in &tp.globals {
+                    let init = self.gen_expr(&g.init, Ctx::Normal);
+                    src.push_str(&format!("    g_{} = {};\n", g.name, init));
+                }
+                src.push_str("    axf_main();\n    return 0;\n}\n");
+            }
+            modules.push(ModuleOut { stem, source: src });
+        }
+        modules
     }
 }

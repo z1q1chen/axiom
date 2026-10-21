@@ -188,8 +188,23 @@ the stated domain, not for all inputs — and the rest stay
 runtime-checked. Functions that are not eligible are absent
 from the report and stay runtime-checked too.
 
+## Separate compilation (v0.8)
+
+`axiomc build --separate` emits one C file per Axiom source
+file under `<binary>.separate/`, compiles each to its own
+object, and links them. Generated functions, invariant
+checkers, and globals get external linkage through a generated
+header (`axiom_gen.h`); each module also carries a private copy
+of the runtime helpers, which are stateless (values are plain
+malloc'd memory), so the copies interoperate. The checker still
+runs on the whole program: module interfaces are the checked
+program itself, not per-module signatures, so changing a shared
+type still rechecks everything even though only changed
+modules need their C recompiled (the driver currently rebuilds
+all objects; it does not do make-style staleness).
+
 ## Roadmap (not in v0.1)
 
 - Proof for a tiny critical core (the tier above bounded).
-- Freeing memory (a real allocator policy), separate compilation.
+- Freeing memory (a real allocator policy).
 - Trait bounds for generic parameters; generic methods.

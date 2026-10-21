@@ -93,6 +93,21 @@ else
 fi
 rm -f /tmp/rockstore_test.db
 
+# Separate compilation: the billing system split per module,
+# compiled to objects, linked, and run.
+rm -rf /tmp/axsep && mkdir -p /tmp/axsep
+ROOT_ABS="$(pwd)"
+AX_ABS="$ROOT_ABS/target/release/axiomc"
+sep_out="$(cd /tmp/axsep && $AX_ABS build $ROOT_ABS/examples/billing/main.ax --separate -o /tmp/axsep/billing 2>&1 && /tmp/axsep/billing)"
+if printf '%s' "$sep_out" | grep -q "ALL CLOSING BALANCES MATCH"; then
+    echo "PASS separate"
+else
+    echo "FAIL separate:"
+    printf '%s\n' "$sep_out"
+    fail=1
+fi
+rm -rf /tmp/axsep
+
 if [ $fail -eq 0 ]; then
     echo "ALL TESTS PASS"
 else

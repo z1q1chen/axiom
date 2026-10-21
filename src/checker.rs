@@ -150,6 +150,9 @@ pub struct TStruct {
     pub fields: Vec<(String, Type)>,
     pub invariants: Vec<TInvariant>,
     pub id: usize,
+    // Source file that defined it (the template's file for
+    // instantiations); drives separate compilation.
+    pub file: String,
 }
 
 #[derive(Clone, Debug)]
@@ -378,6 +381,7 @@ impl Checker {
             fields,
             invariants,
             id,
+            file: template.span.file.clone(),
         });
         Ok(mangled)
     }
@@ -739,6 +743,7 @@ impl Checker {
                 fields,
                 invariants,
                 id: self.struct_ids[s.name.as_str()],
+                file: s.span.file.clone(),
             });
         }
 

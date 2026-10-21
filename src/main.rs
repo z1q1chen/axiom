@@ -23,6 +23,7 @@ fn main() {
     let file = args[2].clone();
     let mut out: Option<String> = None;
     let mut emit_c = false;
+    let mut separate = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -35,6 +36,7 @@ fn main() {
                 out = Some(args[i].clone());
             }
             "--emit-c" => emit_c = true,
+            "--separate" => separate = true,
             other => {
                 eprintln!("axiomc: unknown option {}", other);
                 exit(2);
@@ -45,7 +47,11 @@ fn main() {
 
     let result = match cmd {
         "check" => cmd_check(&file),
+        "build" if separate => cmd_build_separate(&file, out.as_deref()),
         "build" => cmd_build(&file, out.as_deref(), emit_c, false),
+        "run" if separate => Err(
+            "run does not support --separate; build first, then run the binary".to_string(),
+        ),
         "run" => cmd_build(&file, out.as_deref(), emit_c, true),
         "verify" => cmd_verify(&file),
         _ => {
@@ -105,7 +111,7 @@ fn load_file(
     Ok(())
 }
 
-fn compile(file: &str) -> Result<(checker::TProgram, String), String> {
+fn load_and_check(file: &str) -> Result<checker::TProgram, String> {
     let prog = load_program(file)?;
     let tp = checker::Checker::new().check(&prog)?;
     let missing = codegen::natives_missing(&tp);
@@ -115,8 +121,93 @@ fn compile(file: &str) -> Result<(checker::TProgram, String), String> {
             missing.join("', '")
         ));
     }
+    Ok(tp)
+}
+
+fn compile(file: &str) -> Result<(checker::TProgram, String), String> {
+    let tp = load_and_check(file)?;
     let c = codegen::CodeGen::new(&tp).gen_program(&tp);
     Ok((tp, c))
+}
+
+/// Separate compilation: one C file per Axiom source file under
+/// <stem>.separate/, each compiled to its own object, then
+/// linked. The ledger is written exactly as for a normal build.
+fn cmd_build_separate(file: &str, out: Option<&str>) -> Result<(), String> {
+    let tp = load_and_check(file)?;
+    let stem = Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "program".to_string());
+    let bin_path = PathBuf::from(out.map(|s| s.to_string()).unwrap_or_else(|| stem.clone()));
+    if let Some(parent) = bin_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let entry_file = tp
+        .fns
+        .iter()
+        .find(|f| f.name == "main")
+        .map(|f| f.file.clone())
+        .ok_or_else(|| "program has no main function".to_string())?;
+    let mut cg = codegen::CodeGen::new(&tp);
+    cg.separate = true;
+    let header = cg.gen_header(&tp);
+    let modules = cg.gen_modules(&tp, &entry_file);
+    let bin_stem = bin_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| stem.clone());
+    let dir = PathBuf::from(format!("{}.separate", bin_stem));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("axiom_gen.h"), &header).map_err(|e| e.to_string())?;
+    let mut objects: Vec<PathBuf> = Vec::new();
+    for m in &modules {
+        let c_path = dir.join(format!("{}.c", m.stem));
+        let o_path = dir.join(format!("{}.o", m.stem));
+        std::fs::write(&c_path, &m.source).map_err(|e| e.to_string())?;
+        let cc_out = std::process::Command::new("cc")
+            .args(["-O2", "-std=gnu99", "-w", "-c", "-o"])
+            .arg(&o_path)
+            .arg(&c_path)
+            .output()
+            .map_err(|e| format!("cannot run cc: {}", e))?;
+        if !cc_out.status.success() {
+            return Err(format!(
+                "C compilation failed for module {}:\n{}",
+                m.stem,
+                String::from_utf8_lossy(&cc_out.stderr)
+            ));
+        }
+        objects.push(o_path);
+    }
+    let mut link = std::process::Command::new("cc");
+    link.args(["-O2", "-o"]).arg(&bin_path);
+    for o in &objects {
+        link.arg(o);
+    }
+    let link_out = link.output().map_err(|e| format!("cannot run cc: {}", e))?;
+    if !link_out.status.success() {
+        return Err(format!(
+            "link failed:\n{}",
+            String::from_utf8_lossy(&link_out.stderr)
+        ));
+    }
+    let ledger_path = {
+        let mut p = bin_path.as_os_str().to_owned();
+        p.push(".ledger.json");
+        PathBuf::from(p)
+    };
+    std::fs::write(&ledger_path, ledger_json(&tp, &stem)).map_err(|e| e.to_string())?;
+    println!(
+        "built {} ({} modules, {} contracts, ledger at {})",
+        bin_path.display(),
+        modules.len(),
+        count_contracts(&tp),
+        ledger_path.display()
+    );
+    Ok(())
 }
 
 fn ledger_json(tp: &checker::TProgram, program: &str) -> String {
