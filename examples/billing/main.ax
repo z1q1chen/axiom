@@ -1,0 +1,150 @@
+// Billing system demo: a 90-day simulation.
+//
+// Cast: Alice (Pro monthly, metered usage, upgrades to Annual
+// mid-period), Bob (Starter, pays late, churns through dunning),
+// Carol (Annual with a 14-day trial, overpays into credit).
+// Tax is 13% HST. Invoices are net-14; dunning grace is 10 days.
+//
+// The closing checks are the point: every balance below was
+// computed by hand from the scenario, and the program refuses to
+// finish if the books say anything else.
+
+use "reports.ax";
+
+fn main() {
+    let s = new_store(13, 14, 10);
+    open_account(s, 100, "Cash", 0);
+    open_account(s, 110, "Accounts Receivable", 0);
+    open_account(s, 210, "Tax Payable", 1);
+    open_account(s, 220, "Deferred Revenue", 1);
+    open_account(s, 230, "Customer Credits", 1);
+    open_account(s, 400, "Subscription Revenue", 3);
+    open_account(s, 410, "Usage Revenue", 3);
+
+    let starter = add_plan(s, "Starter", 2000, 30, 0, 0);
+    let pro = add_plan(s, "Pro", 5000, 30, 0, 10);
+    let annual = add_plan(s, "Annual", 50000, 360, 14, 0);
+
+    let alice = add_customer(s, "Alice", "alice@example.com");
+    let bob = add_customer(s, "Bob", "bob@example.com");
+    let carol = add_customer(s, "Carol", "carol@example.com");
+
+    print("Day 0: Alice subscribes to Pro, Bob to Starter");
+    let alice_sub = subscribe(s, alice.id, pro.id, 0);
+    let bob_sub = subscribe(s, bob.id, starter.id, 0);
+    print_invoice(s, find_invoice(s, alice_sub.last_invoice_id));
+    print_invoice(s, find_invoice(s, bob_sub.last_invoice_id));
+    let ok = record_payment(s, 1, 5650, "card", 0, true);
+    check ok;
+    ok = record_payment(s, 2, 1000, "card", 0, true);
+    check ok;
+    print("  Alice paid in full; Bob paid $10.00 of $22.60");
+
+    print("Day 5: Alice records 120 usage units");
+    record_usage(s, alice_sub.id, 120);
+
+    print("Day 10: Carol subscribes to Annual (14-day trial)");
+    let carol_sub = subscribe(s, carol.id, annual.id, 10);
+    check carol_sub.state == 0;
+
+    print("Day 15: sweep marks Bob past due");
+    process_day(s, 15);
+    check find_invoice(s, 2).state == 3;
+    check find_sub(s, bob_sub.id).state == 2;
+
+    print("Day 20: Bob's card is declined");
+    ok = record_payment(s, 2, 1260, "card", 20, false);
+    check !ok;
+    check find_invoice(s, 2).amount_paid == 1000;
+
+    print("Day 22: Bob pays the rest and heals");
+    ok = record_payment(s, 2, 1260, "card", 22, true);
+    check ok;
+    check find_invoice(s, 2).state == 1;
+    check find_sub(s, bob_sub.id).state == 1;
+
+    print("Day 24: Carol's trial ends, first Annual invoice");
+    process_day(s, 24);
+    check find_sub(s, carol_sub.id).state == 1;
+    print_invoice(s, find_invoice(s, carol_sub.last_invoice_id));
+    print("  Carol overpays $570.00 on a $565.00 invoice");
+    ok = record_payment(s, 3, 57000, "card", 24, true);
+    check ok;
+    check find_customer(s, carol.id).credit_cents == 500;
+
+    print("Day 30: period roll for Alice and Bob");
+    process_day(s, 30);
+    print_invoice(s, find_invoice(s, alice_sub.last_invoice_id));
+    print_invoice(s, find_invoice(s, bob_sub.last_invoice_id));
+    check balance_of(s, 400) == 7000;
+
+    print("Day 31: Alice pays invoice 4 ($70.06)");
+    ok = record_payment(s, 4, 7006, "card", 31, true);
+    check ok;
+    check find_payment(s, 6).invoice_id == 4;
+
+    print("Day 40: Alice upgrades Pro to Annual mid-period");
+    let upgraded = change_plan(s, alice_sub.id, annual.id, 40);
+    check upgraded.plan_id == annual.id;
+    print_invoice(s, find_invoice(s, upgraded.last_invoice_id));
+    print("  Unused Pro time became credit and part-paid invoice 6");
+
+    print("Day 41: Alice pays the rest of invoice 6");
+    ok = record_payment(s, 6, 53166, "card", 41, true);
+    check ok;
+    check find_invoice(s, 6).state == 1;
+
+    print("Day 45: sweep marks Bob past due again (invoice 5)");
+    process_day(s, 45);
+    check find_invoice(s, 5).state == 3;
+
+    print("Day 50: Alice disputes the usage charge, refund $12.00");
+    let r = refund_payment(s, 6, 1200, 50);
+    check r.amount == 1200;
+    check find_invoice(s, 4).state == 0;
+
+    print("Day 51: sweep marks Alice past due on the reopened invoice");
+    process_day(s, 51);
+    check find_invoice(s, 4).state == 3;
+    check find_sub(s, alice_sub.id).state == 2;
+
+    print("Day 52: Alice re-pays and heals");
+    ok = record_payment(s, 4, 1200, "card", 52, true);
+    check ok;
+    check find_invoice(s, 4).state == 1;
+    check find_sub(s, alice_sub.id).state == 1;
+
+    print("Day 55: Bob exhausts grace, invoice 5 voids, sub cancels");
+    process_day(s, 55);
+    check find_invoice(s, 5).state == 2;
+    check find_sub(s, bob_sub.id).state == 3;
+
+    process_day(s, 60);
+    process_day(s, 90);
+
+    print("");
+    print_statement(s, alice.id);
+    print_statement(s, bob.id);
+    print_statement(s, carol.id);
+    print("");
+    print_revenue_report(s);
+    print_ar_aging(s, 90);
+    print_trial_balance(s);
+
+    // Hand-computed closing balances, in cents.
+    check balance_of(s, 100) == 125082;
+    // Cash: 5650+1000+1260+57000+7006+53166-1200+1200
+    check balance_of(s, 110) == 0;
+    // AR: every invoice paid or voided
+    check balance_of(s, 210) == 14716;
+    // Tax: 650+260+6500+806+6500 (invoice 5's 260 reversed out)
+    check balance_of(s, 220) == 100000;
+    // Deferred: Carol's year + Alice's Annual year, both unearned
+    check balance_of(s, 230) == 500;
+    // Credits: only Carol's overpayment remains
+    check balance_of(s, 400) == 8666;
+    // Sub revenue: Alice 5000 + Bob 2000 + proration 1666
+    check balance_of(s, 410) == 1200;
+    // Usage revenue: 120 units x 10 cents
+    print("ALL CLOSING BALANCES MATCH");
+}

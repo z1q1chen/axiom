@@ -1,0 +1,147 @@
+// Reports: money formatting, trial balance, customer statements,
+// revenue summary, AR aging.
+
+use "billing.ax";
+
+fn fmt_money(cents: int) -> string {
+    if cents < 0 {
+        return "-" + fmt_money(0 - cents);
+    }
+    let rem = cents % 100;
+    let pad = str(rem);
+    if rem < 10 {
+        pad = "0" + pad;
+    }
+    return "$" + str(cents / 100) + "." + pad;
+}
+
+fn sub_state_name(state: int) -> string {
+    if state == 0 {
+        return "trial";
+    }
+    if state == 1 {
+        return "active";
+    }
+    if state == 2 {
+        return "past_due";
+    }
+    return "cancelled";
+}
+
+fn inv_state_name(state: int) -> string {
+    if state == 0 {
+        return "open";
+    }
+    if state == 1 {
+        return "paid";
+    }
+    if state == 2 {
+        return "void";
+    }
+    return "past_due";
+}
+
+fn pay_state_name(state: int) -> string {
+    if state == 0 {
+        return "succeeded";
+    }
+    if state == 1 {
+        return "refunded";
+    }
+    return "failed";
+}
+
+fn print_invoice(s: Store, inv: Invoice) {
+    let cust = find_customer(s, inv.customer_id);
+    print("  Invoice", inv.id, "for", cust.name + ":",
+        "total", fmt_money(inv.total),
+        "paid", fmt_money(inv.amount_paid),
+        "state", inv_state_name(inv.state),
+        "due day", inv.due_day);
+    for ln in inv.lines {
+        print("    -", ln.description + ":",
+            str(ln.quantity), "x", fmt_money(ln.unit_cents),
+            "=", fmt_money(ln.amount));
+    }
+}
+
+fn print_trial_balance(s: Store) {
+    print("== Trial balance ==");
+    let d = 0;
+    let c = 0;
+    for a in s.accounts {
+        let side = "Cr";
+        if is_debit_normal(a) {
+            side = "Dr";
+            d = d + a.balance;
+        } else {
+            c = c + a.balance;
+        }
+        print(" ", a.id, a.name + ":", side, fmt_money(a.balance));
+    }
+    print("  Debit-normal total:", fmt_money(d));
+    print("  Credit-normal total:", fmt_money(c));
+    check trial_balance_ok(s);
+    print("  TRIAL BALANCE OK");
+}
+
+fn print_revenue_report(s: Store) {
+    print("== Revenue and balances ==");
+    print("  Subscription revenue:", fmt_money(balance_of(s, 400)));
+    print("  Usage revenue:", fmt_money(balance_of(s, 410)));
+    print("  Deferred revenue (unearned):", fmt_money(balance_of(s, 220)));
+    print("  Accounts receivable:", fmt_money(balance_of(s, 110)));
+    print("  Cash:", fmt_money(balance_of(s, 100)));
+    print("  Tax payable:", fmt_money(balance_of(s, 210)));
+    print("  Customer credits owed:", fmt_money(balance_of(s, 230)));
+}
+
+fn print_statement(s: Store, customer_id: int) {
+    let cust = find_customer(s, customer_id);
+    print("== Statement:", cust.name, "(" + cust.email + ") ==");
+    print("  Credit balance:", fmt_money(cust.credit_cents));
+    for sub in s.subs {
+        if sub.customer_id == customer_id {
+            let plan = find_plan(s, sub.plan_id);
+            print("  Subscription", sub.id, "on", plan.name + ":",
+                "state", sub_state_name(sub.state),
+                "period day", sub.period_start, "to", sub.period_end,
+                "deferred", fmt_money(sub.deferred_cents));
+        }
+    }
+    for inv in s.invoices {
+        if inv.customer_id == customer_id {
+            print_invoice(s, inv);
+        }
+    }
+    for pay in s.payments {
+        if pay.customer_id == customer_id {
+            print("  Payment", pay.id,
+                "on invoice " + str(pay.invoice_id) + ":",
+                fmt_money(pay.amount), "by", pay.method,
+                "state", pay_state_name(pay.state), "day", pay.day);
+        }
+    }
+}
+
+fn print_ar_aging(s: Store, day: int) {
+    let current = 0;
+    let o1 = 0;
+    let o2 = 0;
+    for inv in s.invoices {
+        if inv.state == 0 || inv.state == 3 {
+            let owed = inv.total - inv.amount_paid;
+            if day <= inv.due_day {
+                current = current + owed;
+            } else if day <= inv.due_day + 14 {
+                o1 = o1 + owed;
+            } else {
+                o2 = o2 + owed;
+            }
+        }
+    }
+    print("== AR aging at day", day, "==");
+    print("  Current:", fmt_money(current));
+    print("  1-14 days overdue:", fmt_money(o1));
+    print("  15+ days overdue:", fmt_money(o2));
+}

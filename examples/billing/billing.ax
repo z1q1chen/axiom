@@ -1,0 +1,449 @@
+// Billing engine: subscriptions, invoicing, payments, refunds,
+// proration, dunning. Every money movement posts a balanced
+// journal entry through ledger.ax.
+//
+// Chart of accounts (opened by main):
+//   100 Cash (asset)            110 Accounts Receivable (asset)
+//   210 Tax Payable (liab.)     220 Deferred Revenue (liab.)
+//   230 Customer Credits (liab.)
+//   400 Subscription Revenue    410 Usage Revenue
+//
+// Accounting model:
+//   Issue invoice:  Dr AR (amount due) + Dr Customer Credits
+//                   (credit applied) / Cr Deferred Revenue (plan,
+//                   billed in advance) + Cr Usage Revenue (usage,
+//                   already consumed) + Cr Tax Payable.
+//   Period end:     Dr Deferred Revenue / Cr Subscription Revenue
+//                   (recognition).
+//   Payment:        Dr Cash / Cr AR (overpayment spills to
+//                   Customer Credits).
+//   Refund:         Dr AR / Cr Cash; the invoice reopens.
+//   Void:           the issuance entry is reversed in full, any
+//                   applied credit returns to the customer.
+
+use "ledger.ax";
+
+fn imin(a: int, b: int) -> int {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn find_customer(s: Store, id: int) -> Customer {
+    let i = 0;
+    while i < len(s.customers) {
+        if s.customers[i].id == id {
+            return s.customers[i];
+        }
+        i = i + 1;
+    }
+    raise("customer not found");
+    return s.customers[0];
+}
+
+fn find_plan(s: Store, id: int) -> Plan {
+    let i = 0;
+    while i < len(s.plans) {
+        if s.plans[i].id == id {
+            return s.plans[i];
+        }
+        i = i + 1;
+    }
+    raise("plan not found");
+    return s.plans[0];
+}
+
+fn find_sub(s: Store, id: int) -> Subscription {
+    let i = 0;
+    while i < len(s.subs) {
+        if s.subs[i].id == id {
+            return s.subs[i];
+        }
+        i = i + 1;
+    }
+    raise("subscription not found");
+    return s.subs[0];
+}
+
+fn find_invoice(s: Store, id: int) -> Invoice {
+    let i = 0;
+    while i < len(s.invoices) {
+        if s.invoices[i].id == id {
+            return s.invoices[i];
+        }
+        i = i + 1;
+    }
+    raise("invoice not found");
+    return s.invoices[0];
+}
+
+fn find_payment(s: Store, id: int) -> Payment {
+    let i = 0;
+    while i < len(s.payments) {
+        if s.payments[i].id == id {
+            return s.payments[i];
+        }
+        i = i + 1;
+    }
+    raise("payment not found");
+    return s.payments[0];
+}
+
+fn find_entry(s: Store, id: int) -> JournalEntry {
+    let i = 0;
+    while i < len(s.entries) {
+        if s.entries[i].id == id {
+            return s.entries[i];
+        }
+        i = i + 1;
+    }
+    raise("journal entry not found");
+    return s.entries[0];
+}
+
+fn tax_on(s: Store, subtotal: int) -> int {
+    // Round half up, integer math only.
+    return (subtotal * s.tax_percent + 50) / 100;
+}
+
+fn add_customer(s: Store, name: string, email: string) -> Customer {
+    let c = Customer {
+        id: s.next_customer, name: name, email: email, credit_cents: 0
+    };
+    s.next_customer = s.next_customer + 1;
+    push(s.customers, c);
+    return c;
+}
+
+fn add_plan(s: Store, name: string, price: int, period_days: int,
+            trial_days: int, usage_cents: int) -> Plan {
+    let p = Plan {
+        id: s.next_plan, name: name, price_cents: price,
+        period_days: period_days, trial_days: trial_days,
+        usage_cents: usage_cents
+    };
+    s.next_plan = s.next_plan + 1;
+    push(s.plans, p);
+    return p;
+}
+
+// Issue the invoice for the subscription's current period. The
+// period fields on the subscription must already describe the
+// period being billed. Pending usage is billed in arrears on the
+// same invoice and then cleared.
+fn issue_invoice(s: Store, sub: Subscription, day: int) -> Invoice {
+    let plan = find_plan(s, sub.plan_id);
+    let cust = find_customer(s, sub.customer_id);
+    let lines: [InvoiceLine] = [];
+    push(lines, InvoiceLine {
+        description: plan.name + " plan, day " + str(sub.period_start)
+            + " to day " + str(sub.period_end),
+        quantity: 1, unit_cents: plan.price_cents,
+        amount: plan.price_cents
+    });
+    let usage_total = sub.pending_usage * plan.usage_cents;
+    if sub.pending_usage > 0 && plan.usage_cents > 0 {
+        push(lines, InvoiceLine {
+            description: "Usage, " + str(sub.pending_usage) + " units",
+            quantity: sub.pending_usage, unit_cents: plan.usage_cents,
+            amount: usage_total
+        });
+    }
+    let subtotal = plan.price_cents + usage_total;
+    let tax = tax_on(s, subtotal);
+    let total = subtotal + tax;
+    let credit_applied = imin(cust.credit_cents, total);
+    let due = total - credit_applied;
+    let inv_id = s.next_invoice;
+
+    let entry_id = 0;
+    if total > 0 {
+        let e = add_entry(s, day, "Invoice " + str(inv_id) + " issued");
+        if due > 0 {
+            add_line(e, 110, due, 0);
+        }
+        if credit_applied > 0 {
+            add_line(e, 230, credit_applied, 0);
+        }
+        if plan.price_cents > 0 {
+            add_line(e, 220, 0, plan.price_cents);
+        }
+        if usage_total > 0 {
+            add_line(e, 410, 0, usage_total);
+        }
+        if tax > 0 {
+            add_line(e, 210, 0, tax);
+        }
+        let ok = post(s, e);
+        check ok;
+        entry_id = e.id;
+    }
+
+    let state = 0;
+    if credit_applied == total {
+        state = 1;
+    }
+    let inv = Invoice {
+        id: inv_id, customer_id: cust.id, sub_id: sub.id,
+        state: state, issued_day: day, due_day: day + s.due_days,
+        lines: lines, subtotal: subtotal, plan_cents: plan.price_cents,
+        usage_cents: usage_total, tax: tax, total: total,
+        credit_applied: credit_applied, amount_paid: credit_applied,
+        entry_id: entry_id
+    };
+    s.next_invoice = s.next_invoice + 1;
+    push(s.invoices, inv);
+    cust.credit_cents = cust.credit_cents - credit_applied;
+    sub.deferred_cents = sub.deferred_cents + plan.price_cents;
+    sub.pending_usage = 0;
+    sub.last_invoice_id = inv_id;
+    return inv;
+}
+
+fn subscribe(s: Store, customer_id: int, plan_id: int,
+             day: int) -> Subscription {
+    let plan = find_plan(s, plan_id);
+    let sub = Subscription {
+        id: s.next_sub, customer_id: customer_id, plan_id: plan_id,
+        state: 1, period_start: day, period_end: day + plan.period_days,
+        deferred_cents: 0, pending_usage: 0, last_invoice_id: 0
+    };
+    s.next_sub = s.next_sub + 1;
+    push(s.subs, sub);
+    if plan.trial_days > 0 {
+        sub.state = 0;
+        sub.period_end = day + plan.trial_days;
+    } else {
+        let inv = issue_invoice(s, sub, day);
+        check inv.id == sub.last_invoice_id;
+    }
+    return sub;
+}
+
+fn record_usage(s: Store, sub_id: int, units: int) {
+    requires units > 0;
+    let sub = find_sub(s, sub_id);
+    sub.pending_usage = sub.pending_usage + units;
+}
+
+// Record a payment attempt. A failed attempt is stored (state 2)
+// and changes nothing else. A successful one posts Dr Cash /
+// Cr AR; any amount above the invoice balance becomes customer
+// credit. Returns true iff the payment succeeded.
+fn record_payment(s: Store, invoice_id: int, amount: int,
+                  method: string, day: int, success: bool) -> bool {
+    requires amount > 0;
+    let inv = find_invoice(s, invoice_id);
+    let cust = find_customer(s, inv.customer_id);
+    let pay = Payment {
+        id: s.next_payment, invoice_id: invoice_id,
+        customer_id: cust.id, amount: amount, method: method,
+        state: 2, day: day
+    };
+    s.next_payment = s.next_payment + 1;
+    push(s.payments, pay);
+    if !success {
+        return false;
+    }
+    pay.state = 0;
+    check inv.state == 0 || inv.state == 3;
+    let remaining = inv.total - inv.amount_paid;
+    let applied = imin(amount, remaining);
+    let excess = amount - applied;
+    let e = add_entry(s, day, "Payment for invoice " + str(invoice_id));
+    add_line(e, 100, amount, 0);
+    if applied > 0 {
+        add_line(e, 110, 0, applied);
+    }
+    if excess > 0 {
+        add_line(e, 230, 0, excess);
+    }
+    let ok = post(s, e);
+    check ok;
+    inv.amount_paid = inv.amount_paid + applied;
+    if inv.amount_paid == inv.total {
+        inv.state = 1;
+    }
+    if excess > 0 {
+        cust.credit_cents = cust.credit_cents + excess;
+    }
+    // A past-due subscription heals once it has no past-due
+    // invoices left.
+    let sub = find_sub(s, inv.sub_id);
+    if sub.state == 2 {
+        let blocked = false;
+        for other in s.invoices {
+            if other.sub_id == sub.id && other.state == 3 {
+                blocked = true;
+            }
+        }
+        if !blocked {
+            sub.state = 1;
+        }
+    }
+    return true;
+}
+
+// Refund part or all of a succeeded payment. Cash goes back out
+// and AR reopens for the part that had settled the invoice; if
+// the payment had overpaid into customer credit, the refund claws
+// that credit back first-class too. A full refund marks the
+// payment refunded.
+fn refund_payment(s: Store, payment_id: int, amount: int,
+                  day: int) -> Refund {
+    requires amount > 0;
+    let pay = find_payment(s, payment_id);
+    check pay.state == 0;
+    check amount <= pay.amount;
+    let inv = find_invoice(s, pay.invoice_id);
+    let cust = find_customer(s, inv.customer_id);
+    let to_invoice = imin(amount, inv.amount_paid - inv.credit_applied);
+    let to_credit = amount - to_invoice;
+    check cust.credit_cents >= to_credit;
+    let e = add_entry(s, day, "Refund for invoice " + str(inv.id));
+    if to_invoice > 0 {
+        add_line(e, 110, to_invoice, 0);
+    }
+    if to_credit > 0 {
+        add_line(e, 230, to_credit, 0);
+    }
+    add_line(e, 100, 0, amount);
+    let ok = post(s, e);
+    check ok;
+    inv.amount_paid = inv.amount_paid - to_invoice;
+    cust.credit_cents = cust.credit_cents - to_credit;
+    if inv.state == 1 && inv.amount_paid < inv.total {
+        inv.state = 0;
+    }
+    if amount == pay.amount {
+        pay.state = 1;
+    }
+    let r = Refund {
+        id: s.next_refund, payment_id: payment_id,
+        invoice_id: inv.id, amount: amount, day: day
+    };
+    s.next_refund = s.next_refund + 1;
+    push(s.refunds, r);
+    return r;
+}
+
+fn void_invoice(s: Store, inv: Invoice, day: int) {
+    requires inv.state == 0 || inv.state == 3;
+    // Only credit may have settled a voidable invoice. Cash
+    // settlements must be refunded first, or the reversal would
+    // drive AR negative for money already returned.
+    check inv.amount_paid == inv.credit_applied;
+    if inv.entry_id != 0 {
+        let e = find_entry(s, inv.entry_id);
+        let r = reverse_entry(s, e, day);
+        check r.state == 1;
+    }
+    if inv.credit_applied > 0 {
+        let cust = find_customer(s, inv.customer_id);
+        cust.credit_cents = cust.credit_cents + inv.credit_applied;
+    }
+    let sub = find_sub(s, inv.sub_id);
+    if sub.deferred_cents >= inv.plan_cents {
+        sub.deferred_cents = sub.deferred_cents - inv.plan_cents;
+    } else {
+        sub.deferred_cents = 0;
+    }
+    inv.state = 2;
+}
+
+// Move a subscription to a new plan mid-period. The unused part of
+// the current period's deferred revenue becomes customer credit,
+// the used part is recognized immediately, and a fresh period
+// starts today on the new plan with an immediate invoice (which
+// spends the credit first).
+fn change_plan(s: Store, sub_id: int, new_plan_id: int,
+               day: int) -> Subscription {
+    let sub = find_sub(s, sub_id);
+    check sub.state == 1 || sub.state == 2;
+    let new_plan = find_plan(s, new_plan_id);
+    let span = sub.period_end - sub.period_start;
+    let elapsed = day - sub.period_start;
+    check elapsed >= 0 && elapsed < span;
+    if sub.deferred_cents > 0 {
+        let recognized = sub.deferred_cents * elapsed / span;
+        let unused = sub.deferred_cents - recognized;
+        let e = add_entry(s, day, "Plan change proration");
+        add_line(e, 220, sub.deferred_cents, 0);
+        if recognized > 0 {
+            add_line(e, 400, 0, recognized);
+        }
+        if unused > 0 {
+            add_line(e, 230, 0, unused);
+        }
+        let ok = post(s, e);
+        check ok;
+        let cust = find_customer(s, sub.customer_id);
+        cust.credit_cents = cust.credit_cents + unused;
+        sub.deferred_cents = 0;
+    }
+    sub.plan_id = new_plan_id;
+    sub.period_end = day + new_plan.period_days;
+    sub.period_start = day;
+    let inv = issue_invoice(s, sub, day);
+    check inv.sub_id == sub.id;
+    return sub;
+}
+
+fn cancel_subscription(s: Store, sub_id: int) {
+    let sub = find_sub(s, sub_id);
+    sub.state = 3;
+}
+
+// The daily sweep. Call once per simulated day, in order.
+// 1. Open invoices past their due day become past_due and drag
+//    their subscription with them; past_due invoices that exhaust
+//    the grace window void their invoice and cancel the
+//    subscription (write-off by full reversal: the books end as
+//    if the invoice never happened).
+// 2. Trials ending today convert to active with a first invoice.
+//    Periods ending today recognize their deferred revenue and
+//    roll into a new period with a new invoice.
+fn process_day(s: Store, day: int) {
+    for inv in s.invoices {
+        if inv.state == 0 && day > inv.due_day
+                && inv.amount_paid < inv.total {
+            inv.state = 3;
+            let sub = find_sub(s, inv.sub_id);
+            if sub.state == 1 {
+                sub.state = 2;
+            }
+        }
+        if inv.state == 3 && day > inv.due_day + s.grace_days {
+            let sub = find_sub(s, inv.sub_id);
+            if sub.state != 3 {
+                void_invoice(s, inv, day);
+                cancel_subscription(s, sub.id);
+            }
+        }
+    }
+    for sub in s.subs {
+        let plan = find_plan(s, sub.plan_id);
+        if sub.state == 0 && day >= sub.period_end {
+            sub.state = 1;
+            sub.period_end = day + plan.period_days;
+            sub.period_start = day;
+            let inv = issue_invoice(s, sub, day);
+            check inv.id > 0;
+        } else if (sub.state == 1 || sub.state == 2)
+                && day >= sub.period_end {
+            if sub.deferred_cents > 0 {
+                let e = add_entry(s, day, "Revenue recognition");
+                add_line(e, 220, sub.deferred_cents, 0);
+                add_line(e, 400, 0, sub.deferred_cents);
+                let ok = post(s, e);
+                check ok;
+                sub.deferred_cents = 0;
+            }
+            sub.period_end = day + plan.period_days;
+            sub.period_start = day;
+            let inv = issue_invoice(s, sub, day);
+            check inv.id > 0;
+        }
+    }
+}

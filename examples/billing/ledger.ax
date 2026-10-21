@@ -1,0 +1,115 @@
+// Double-entry ledger. Every posted entry has debits == credits,
+// so the trial balance (sum of debit-normal balances == sum of
+// credit-normal balances) holds after every operation.
+
+use "types.ax";
+
+fn is_debit_normal(a: Account) -> bool {
+    return a.kind == 0 || a.kind == 4;
+}
+
+fn open_account(s: Store, id: int, name: string, kind: int) -> Account {
+    let a = Account { id: id, name: name, kind: kind, balance: 0 };
+    push(s.accounts, a);
+    return a;
+}
+
+fn find_account(s: Store, id: int) -> Account {
+    let i = 0;
+    while i < len(s.accounts) {
+        if s.accounts[i].id == id {
+            return s.accounts[i];
+        }
+        i = i + 1;
+    }
+    raise("account not found");
+    return s.accounts[0];
+}
+
+fn balance_of(s: Store, id: int) -> int {
+    return find_account(s, id).balance;
+}
+
+fn add_entry(s: Store, day: int, memo: string) -> JournalEntry {
+    let lines: [EntryLine] = [];
+    let e = JournalEntry {
+        id: s.next_entry, day: day, memo: memo, state: 0, lines: lines
+    };
+    s.next_entry = s.next_entry + 1;
+    push(s.entries, e);
+    return e;
+}
+
+fn add_line(e: JournalEntry, account_id: int, debit: int, credit: int) {
+    push(e.lines, EntryLine {
+        account_id: account_id, debit: debit, credit: credit
+    });
+}
+
+fn entry_debits(e: JournalEntry) -> int {
+    let total = 0;
+    for ln in e.lines {
+        total = total + ln.debit;
+    }
+    return total;
+}
+
+fn entry_credits(e: JournalEntry) -> int {
+    let total = 0;
+    for ln in e.lines {
+        total = total + ln.credit;
+    }
+    return total;
+}
+
+// Post an entry: refuse (return false, entry stays draft) when the
+// entry is empty or unbalanced. Otherwise apply every line to its
+// account balance, on the account's normal side.
+fn post(s: Store, e: JournalEntry) -> bool {
+    requires e.state == 0;
+    ensures result == false || e.state == 1;
+    let d = entry_debits(e);
+    let c = entry_credits(e);
+    if d == 0 || d != c {
+        return false;
+    }
+    for ln in e.lines {
+        let a = find_account(s, ln.account_id);
+        if is_debit_normal(a) {
+            a.balance = a.balance + ln.debit - ln.credit;
+        } else {
+            a.balance = a.balance + ln.credit - ln.debit;
+        }
+    }
+    e.state = 1;
+    return true;
+}
+
+// Reverse a posted entry by posting its mirror image and marking
+// the original reversed. Used for voids: the books end up exactly
+// as if the original entry had never posted.
+fn reverse_entry(s: Store, e: JournalEntry, day: int) -> JournalEntry {
+    requires e.state == 1;
+    ensures e.state == 2;
+    let r = add_entry(s, day, "Reversal: " + e.memo);
+    for ln in e.lines {
+        add_line(r, ln.account_id, ln.credit, ln.debit);
+    }
+    let ok = post(s, r);
+    check ok;
+    e.state = 2;
+    return r;
+}
+
+fn trial_balance_ok(s: Store) -> bool {
+    let d = 0;
+    let c = 0;
+    for a in s.accounts {
+        if is_debit_normal(a) {
+            d = d + a.balance;
+        } else {
+            c = c + a.balance;
+        }
+    }
+    return d == c;
+}

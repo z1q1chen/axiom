@@ -1,0 +1,180 @@
+// Billing system: domain types.
+//
+// All money is integer cents. No floats touch money, ever.
+// Time is an integer day counter (day 0 = system start). A "period"
+// is plan.period_days long; invoices are due store.due_days after
+// issue; subscriptions get store.grace_days of grace after that.
+//
+// State codes:
+//   Subscription.state: 0 trial, 1 active, 2 past_due, 3 cancelled
+//   Invoice.state:      0 open, 1 paid, 2 void, 3 past_due
+//   Payment.state:      0 succeeded, 1 refunded, 2 failed
+//   JournalEntry.state: 0 draft, 1 posted, 2 reversed
+//   Account.kind:       0 asset, 1 liability, 2 equity, 3 revenue,
+//                       4 expense. Assets and expenses are
+//                       debit-normal; the rest are credit-normal.
+//                       Account.balance is kept on the normal side
+//                       and is therefore never negative.
+
+struct Account {
+    id: int;
+    name: string;
+    kind: int;
+    balance: int;
+    invariant balance >= 0;
+    invariant kind >= 0 && kind <= 4;
+}
+
+struct EntryLine {
+    account_id: int;
+    debit: int;
+    credit: int;
+    invariant debit >= 0 && credit >= 0;
+    invariant debit == 0 || credit == 0;
+}
+
+struct JournalEntry {
+    id: int;
+    day: int;
+    memo: string;
+    state: int;
+    lines: [EntryLine];
+    invariant state >= 0 && state <= 2;
+}
+
+struct Customer {
+    id: int;
+    name: string;
+    email: string;
+    credit_cents: int;
+    invariant credit_cents >= 0;
+}
+
+struct Plan {
+    id: int;
+    name: string;
+    price_cents: int;
+    period_days: int;
+    trial_days: int;
+    usage_cents: int;
+    invariant price_cents >= 0;
+    invariant period_days > 0;
+    invariant trial_days >= 0;
+    invariant usage_cents >= 0;
+}
+
+struct Subscription {
+    id: int;
+    customer_id: int;
+    plan_id: int;
+    state: int;
+    period_start: int;
+    period_end: int;
+    deferred_cents: int;
+    pending_usage: int;
+    last_invoice_id: int;
+    invariant state >= 0 && state <= 3;
+    invariant period_end >= period_start;
+    invariant deferred_cents >= 0;
+    invariant pending_usage >= 0;
+}
+
+struct InvoiceLine {
+    description: string;
+    quantity: int;
+    unit_cents: int;
+    amount: int;
+    invariant quantity > 0;
+    invariant amount == quantity * unit_cents;
+}
+
+struct Invoice {
+    id: int;
+    customer_id: int;
+    sub_id: int;
+    state: int;
+    issued_day: int;
+    due_day: int;
+    lines: [InvoiceLine];
+    subtotal: int;
+    plan_cents: int;
+    usage_cents: int;
+    tax: int;
+    total: int;
+    credit_applied: int;
+    amount_paid: int;
+    entry_id: int;
+    invariant state >= 0 && state <= 3;
+    invariant subtotal >= 0 && tax >= 0 && total >= 0;
+    invariant total == subtotal + tax;
+    invariant plan_cents + usage_cents == subtotal;
+    invariant credit_applied >= 0 && credit_applied <= total;
+    invariant amount_paid >= credit_applied && amount_paid <= total;
+}
+
+// amount_paid starts at credit_applied: credit is a settlement, so
+// an invoice fully covered by credit is born paid. Invoice fields
+// other than state and amount_paid are never mutated after the
+// literal is built, which keeps the total invariants true after
+// every single assignment.
+
+struct Payment {
+    id: int;
+    invoice_id: int;
+    customer_id: int;
+    amount: int;
+    method: string;
+    state: int;
+    day: int;
+    invariant amount > 0;
+    invariant state >= 0 && state <= 2;
+}
+
+struct Refund {
+    id: int;
+    payment_id: int;
+    invoice_id: int;
+    amount: int;
+    day: int;
+    invariant amount > 0;
+}
+
+struct Store {
+    customers: [Customer];
+    plans: [Plan];
+    subs: [Subscription];
+    invoices: [Invoice];
+    payments: [Payment];
+    refunds: [Refund];
+    accounts: [Account];
+    entries: [JournalEntry];
+    next_customer: int;
+    next_plan: int;
+    next_sub: int;
+    next_invoice: int;
+    next_payment: int;
+    next_refund: int;
+    next_entry: int;
+    tax_percent: int;
+    due_days: int;
+    grace_days: int;
+}
+
+fn new_store(tax_percent: int, due_days: int, grace_days: int) -> Store {
+    let cs: [Customer] = [];
+    let ps: [Plan] = [];
+    let ss: [Subscription] = [];
+    let invs: [Invoice] = [];
+    let pays: [Payment] = [];
+    let refs: [Refund] = [];
+    let accs: [Account] = [];
+    let ents: [JournalEntry] = [];
+    return Store {
+        customers: cs, plans: ps, subs: ss, invoices: invs,
+        payments: pays, refunds: refs, accounts: accs, entries: ents,
+        next_customer: 1, next_plan: 1, next_sub: 1, next_invoice: 1,
+        next_payment: 1, next_refund: 1, next_entry: 1,
+        tax_percent: tax_percent, due_days: due_days,
+        grace_days: grace_days
+    };
+}

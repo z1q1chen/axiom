@@ -65,6 +65,16 @@ int, float, has, keys, del, split`, and a `check expr;` statement
 for inline assertions.
 
 See `DESIGN.md` for the spec, the contract semantics, and the
-roadmap. Examples live in `examples/`; the substantial one is
+roadmap. Examples live in `examples/`; the substantial ones are
 `examples/ledger/`, a double-entry bookkeeping system with balanced
-journal entries enforced by contract.
+journal entries enforced by contract, and `examples/billing/`, a
+full billing system built on that ledger: subscription lifecycle
+with trials, period invoicing with metered usage, 13% tax,
+payments with overpay-to-credit, refunds, mid-period plan-change
+proration, and a dunning sweep (past due, grace, void, cancel).
+Its 90-day simulation asserts every closing balance in cents
+before it prints the trial balance.
+
+```sh
+./target/release/axiomc run examples/billing/main.ax
+```
