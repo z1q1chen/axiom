@@ -13,12 +13,17 @@ program, and records every one of them in a **verification ledger**.
 
 ## Status
 
-v0.4, built 2026-10-21. A working language, not the full design
-proposal: formal proof tiers and capability binding are on the
-roadmap in `DESIGN.md`, not in this build. Contracts are
-runtime-checked, and the ledger says exactly that.
+v0.5, built 2026-10-21. A working language, not the full design
+proposal: the proof tier is on the roadmap in `DESIGN.md`, not in
+this build. Contracts are runtime-checked (or bound, for externs),
+and the ledger says exactly that.
 
-v0.4 adds generics: generic structs and functions, monomorphized
+v0.5 adds extern functions and capability binding: `extern fn`
+binds to a native runtime implementation, grouped by
+`capability` blocks, contracts checked at the boundary, ledger
+tier `bound`. Shipped natives cover files and stdin/env; builtins
+`join` / `replace` also landed. See `examples/files.ax`. v0.4
+added generics: generic structs and functions, monomorphized
 per instantiation, type arguments explicit or inferred (including
 return position). See `examples/generics.ax`. v0.3 added methods
 (`impl` blocks, `obj.m(args)`) and string interpolation

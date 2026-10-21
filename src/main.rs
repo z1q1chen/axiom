@@ -106,6 +106,13 @@ fn load_file(
 fn compile(file: &str) -> Result<(checker::TProgram, String), String> {
     let prog = load_program(file)?;
     let tp = checker::Checker::new().check(&prog)?;
+    let missing = codegen::natives_missing(&tp);
+    if !missing.is_empty() {
+        return Err(format!(
+            "extern fn '{}' has no native implementation in the Axiom runtime",
+            missing.join("', '")
+        ));
+    }
     let c = codegen::CodeGen::new(&tp).gen_program(&tp);
     Ok((tp, c))
 }
@@ -113,18 +120,37 @@ fn compile(file: &str) -> Result<(checker::TProgram, String), String> {
 fn ledger_json(tp: &checker::TProgram, program: &str) -> String {
     let mut entries: Vec<String> = Vec::new();
     for f in &tp.fns {
+        // Extern bindings are recorded at the bound tier: the
+        // implementation is native (trusted as bound), while its
+        // contracts are still checked on every call.
+        let tier = if f.is_extern { "bound" } else { "runtime-checked" };
+        if f.is_extern {
+            let cap = match &f.capability {
+                Some(c) => format!(", \"capability\": \"{}\"", codegen::c_escape(c)),
+                None => String::new(),
+            };
+            entries.push(format!(
+                "    {{\"kind\": \"binding\", \"owner\": \"fn {}\", \"text\": \"native implementation axn_{}\"{}, \"file\": \"{}\", \"line\": {}, \"tier\": \"bound\"}}",
+                codegen::c_escape(&f.name),
+                codegen::c_escape(&f.name),
+                cap,
+                codegen::c_escape(&f.file),
+                f.line
+            ));
+        }
         for c in &f.contracts {
             let kind = match c.kind {
                 ast::ContractKind::Requires => "requires",
                 ast::ContractKind::Ensures => "ensures",
             };
             entries.push(format!(
-                "    {{\"kind\": \"{}\", \"owner\": \"fn {}\", \"text\": \"{}\", \"file\": \"{}\", \"line\": {}, \"tier\": \"runtime-checked\"}}",
+                "    {{\"kind\": \"{}\", \"owner\": \"fn {}\", \"text\": \"{}\", \"file\": \"{}\", \"line\": {}, \"tier\": \"{}\"}}",
                 kind,
                 codegen::c_escape(&f.name),
                 codegen::c_escape(&c.text),
                 codegen::c_escape(&c.file),
-                c.line
+                c.line,
+                tier
             ));
         }
     }

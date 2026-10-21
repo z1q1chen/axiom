@@ -161,6 +161,8 @@ pub struct TFn {
     pub body: Vec<TStmt>,
     pub file: String,
     pub line: u32,
+    pub is_extern: bool,
+    pub capability: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,7 +181,7 @@ pub struct TProgram {
 
 const BUILTINS: &[&str] = &[
     "print", "len", "push", "range", "str", "int", "float", "raise", "has", "keys", "del",
-    "split",
+    "split", "join", "replace",
 ];
 
 struct FnSig {
@@ -849,11 +851,13 @@ impl Checker {
             });
         }
         let mut tbody = Vec::new();
-        for stmt in &f.body {
-            tbody.push(self.check_stmt(stmt)?);
+        if !f.is_extern {
+            for stmt in &f.body {
+                tbody.push(self.check_stmt(stmt)?);
+            }
         }
         self.scopes.pop();
-        if sig.ret != Type::Void && !ends_with_return(&f.body) {
+        if !f.is_extern && sig.ret != Type::Void && !ends_with_return(&f.body) {
             return Err(format!(
                 "{}:{}: function '{}' may end without returning a value",
                 f.span.file, f.span.line, f.name
@@ -867,6 +871,8 @@ impl Checker {
             body: tbody,
             file: f.span.file.clone(),
             line: f.span.line,
+            is_extern: f.is_extern,
+            capability: f.capability.clone(),
         })
     }
 
@@ -1877,6 +1883,37 @@ impl Checker {
                     return self.err(span, "raise() needs a string message");
                 }
                 Ok(te(TExprKind::Builtin(name.into(), vec![a]), Type::Void))
+            }
+            "join" => {
+                if args.len() != 2 {
+                    return Err(arity("2", args.len()));
+                }
+                let arr = self.check_expr(&args[0], None)?;
+                if arr.ty != Type::Array(Box::new(Type::Str)) {
+                    return self.err(
+                        span,
+                        &format!("join() needs a [string] first argument, got {}", arr.ty.name()),
+                    );
+                }
+                let sep = self.check_expr(&args[1], Some(&Type::Str))?;
+                if sep.ty != Type::Str {
+                    return self.err(span, "join() needs a string separator");
+                }
+                Ok(te(TExprKind::Builtin(name.into(), vec![arr, sep]), Type::Str))
+            }
+            "replace" => {
+                if args.len() != 3 {
+                    return Err(arity("3", args.len()));
+                }
+                let mut targs = Vec::new();
+                for a in args {
+                    let t = self.check_expr(a, Some(&Type::Str))?;
+                    if t.ty != Type::Str {
+                        return self.err(span, "replace() needs three strings");
+                    }
+                    targs.push(t);
+                }
+                Ok(te(TExprKind::Builtin(name.into(), targs), Type::Str))
             }
             _ => self.err(span, &format!("unknown builtin '{}'", name)),
         }

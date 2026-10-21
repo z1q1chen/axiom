@@ -1,0 +1,12 @@
+// An extern fn's requires is checked before the native call:
+// the empty path must be rejected at the boundary.
+capability file {
+    extern fn read_file(path: string) -> string {
+        requires len(path) > 0;
+    }
+}
+
+fn main() {
+    let data = read_file("");
+    print(data);
+}

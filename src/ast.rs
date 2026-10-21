@@ -64,6 +64,11 @@ pub struct FnDef {
     pub span: Span,
     // Some(struct name) for methods declared in an `impl` block.
     pub owner: Option<String>,
+    // extern: no Axiom body; bound to a native implementation in
+    // the runtime. capability: the `capability` block that declared
+    // it, if any.
+    pub is_extern: bool,
+    pub capability: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -142,10 +142,27 @@ of it); there are no trait bounds yet, so `fn sum<T>(xs: [T])`
 cannot add elements. Generic methods and methods on generic
 structs are not supported yet.
 
+## Extern functions and capabilities (v0.5)
+
+`extern fn` declares a function whose body is a native
+implementation in the runtime (`axn_<name>` in
+`runtime/axiom_rt.c`). The compiler refuses to build when an
+extern has no native implementation. Contracts on an extern are
+checked by the generated wrapper on every call, before and after
+the native code runs: the native is trusted to exist and perform,
+never to respect the contract silently.
+
+`capability Name { extern fn ...; ... }` groups externs under a
+name. The ledger records each binding, and the contracts on it,
+at tier **bound** (the implementation is bound native code; its
+contracts are runtime-checked at the boundary).
+
+Shipped natives: capability `file` (read_file, write_file,
+append_file, file_exists) and `io` (read_line, env_get). Builtins
+`join` and `replace` also arrived in v0.5.
+
 ## Roadmap (not in v0.1)
 
-- Capability declarations with binding to pre-verified
-  implementations (the proposal's capability layer).
 - Contract tiers above runtime-checked: bounded model checking of
   small pure functions; proof for a tiny critical core.
 - Freeing memory (a real allocator policy), separate compilation.

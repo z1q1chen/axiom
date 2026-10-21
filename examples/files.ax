@@ -1,0 +1,33 @@
+// v0.5: extern fn and capability binding. The declarations are
+// Axiom; the implementations are native (runtime/axiom_rt.c).
+// Contracts on an extern are checked at the call boundary.
+
+capability file {
+    extern fn read_file(path: string) -> string {
+        requires len(path) > 0;
+    }
+    extern fn write_file(path: string, data: string) -> bool;
+    extern fn append_file(path: string, data: string) -> bool;
+    extern fn file_exists(path: string) -> bool;
+}
+
+capability io {
+    extern fn read_line() -> string;
+    extern fn env_get(name: string) -> string;
+}
+
+fn main() {
+    let path = "/tmp/axiom_files_demo.txt";
+    let w = write_file(path, "alpha\nbeta\n");
+    check w;
+    let a = append_file(path, "gamma\n");
+    check a;
+    let data = read_file(path);
+    let lines = split(data, "\n");
+    let joined = join(lines, ",");
+    print("lines: {joined}");
+    let rep = replace(data, "beta", "BETA");
+    print("replaced: {rep}");
+    let home = env_get("HOME");
+    print("home set: {len(home) > 0}, exists: {file_exists(path)}");
+}

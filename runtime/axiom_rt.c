@@ -394,4 +394,138 @@ static void ax_raise(AxVal msg) {
     if (msg.tag == AX_STR) ax_fail(msg.u.s);
     ax_fail("raised");
 }
+static AxVal ax_join(AxVal arr, AxVal sep) {
+    if (arr.tag != AX_ARR || sep.tag != AX_STR)
+        ax_fail("type error: join() needs [string] and a string");
+    size_t cap = 128, n = 0;
+    char *out = ax_alloc(cap);
+    size_t sl = strlen(sep.u.s);
+    for (int64_t i = 0; i < arr.u.arr->len; i++) {
+        AxVal el = arr.u.arr->data[i];
+        if (el.tag != AX_STR) ax_fail("type error: join() element is not a string");
+        size_t m = strlen(el.u.s);
+        while (n + m + sl + 1 > cap) {
+            cap *= 2;
+            char *nd = ax_alloc(cap);
+            memcpy(nd, out, n);
+            out = nd;
+        }
+        if (i) { memcpy(out + n, sep.u.s, sl); n += sl; }
+        memcpy(out + n, el.u.s, m); n += m;
+    }
+    out[n] = 0;
+    AxVal r; r.tag = AX_STR; r.u.s = out; return r;
+}
+static AxVal ax_replace(AxVal s, AxVal from, AxVal to) {
+    if (s.tag != AX_STR || from.tag != AX_STR || to.tag != AX_STR)
+        ax_fail("type error: replace() needs three strings");
+    if (from.u.s[0] == 0) return s;
+    size_t cap = strlen(s.u.s) + 64, n = 0;
+    char *out = ax_alloc(cap);
+    size_t fl = strlen(from.u.s), tl = strlen(to.u.s);
+    const char *cur = s.u.s;
+    for (;;) {
+        const char *hit = strstr(cur, from.u.s);
+        size_t chunk = hit ? (size_t)(hit - cur) : strlen(cur);
+        while (n + chunk + tl + 1 > cap) {
+            cap *= 2;
+            char *nd = ax_alloc(cap);
+            memcpy(nd, out, n);
+            out = nd;
+        }
+        memcpy(out + n, cur, chunk); n += chunk;
+        if (!hit) break;
+        memcpy(out + n, to.u.s, tl); n += tl;
+        cur = hit + fl;
+    }
+    out[n] = 0;
+    AxVal r; r.tag = AX_STR; r.u.s = out; return r;
+}
+
+/* ---- native bindings (extern fn implementations) ----
+   Every `extern fn name(...)` in Axiom binds to axn_name here.
+   axiomc refuses to build when one is missing. */
+static char *ax_read_all(FILE *fp, size_t *out_len) {
+    size_t cap = 8192, n = 0;
+    char *buf = ax_alloc(cap);
+    for (;;) {
+        if (n == cap) {
+            cap *= 2;
+            char *nd = ax_alloc(cap);
+            memcpy(nd, buf, n);
+            buf = nd;
+        }
+        size_t got = fread(buf + n, 1, cap - n, fp);
+        n += got;
+        if (got == 0) break;
+    }
+    if (out_len) *out_len = n;
+    char *done = ax_alloc(n + 1);
+    memcpy(done, buf, n);
+    done[n] = 0;
+    return done;
+}
+static AxVal axn_read_file(AxVal path) {
+    if (path.tag != AX_STR) ax_fail("type error: read_file path");
+    FILE *fp = fopen(path.u.s, "rb");
+    if (!fp) {
+        fprintf(stderr, "axiom: cannot read file '%s'\n", path.u.s);
+        exit(70);
+    }
+    char *data = ax_read_all(fp, NULL);
+    fclose(fp);
+    AxVal r; r.tag = AX_STR; r.u.s = data; return r;
+}
+static AxVal axn_write_file(AxVal path, AxVal data) {
+    if (path.tag != AX_STR || data.tag != AX_STR)
+        ax_fail("type error: write_file arguments");
+    FILE *fp = fopen(path.u.s, "wb");
+    if (!fp) return ax_bool(0);
+    size_t n = strlen(data.u.s);
+    int ok = fwrite(data.u.s, 1, n, fp) == n;
+    if (fclose(fp) != 0) ok = 0;
+    return ax_bool(ok);
+}
+static AxVal axn_append_file(AxVal path, AxVal data) {
+    if (path.tag != AX_STR || data.tag != AX_STR)
+        ax_fail("type error: append_file arguments");
+    FILE *fp = fopen(path.u.s, "ab");
+    if (!fp) return ax_bool(0);
+    size_t n = strlen(data.u.s);
+    int ok = fwrite(data.u.s, 1, n, fp) == n;
+    if (fclose(fp) != 0) ok = 0;
+    return ax_bool(ok);
+}
+static AxVal axn_file_exists(AxVal path) {
+    if (path.tag != AX_STR) ax_fail("type error: file_exists path");
+    FILE *fp = fopen(path.u.s, "rb");
+    if (!fp) return ax_bool(0);
+    fclose(fp);
+    return ax_bool(1);
+}
+static AxVal axn_read_line(void) {
+    size_t cap = 256, n = 0;
+    char *buf = ax_alloc(cap);
+    int c;
+    while ((c = getchar()) != EOF && c != '\n') {
+        if (n + 1 >= cap) {
+            cap *= 2;
+            char *nd = ax_alloc(cap);
+            memcpy(nd, buf, n);
+            buf = nd;
+        }
+        buf[n++] = (char)c;
+    }
+    if (c == EOF && n == 0) {
+        AxVal r; r.tag = AX_STR; r.u.s = (char *)""; return r;
+    }
+    if (n > 0 && buf[n - 1] == '\r') n--;
+    buf[n] = 0;
+    AxVal r; r.tag = AX_STR; r.u.s = buf; return r;
+}
+static AxVal axn_env_get(AxVal name) {
+    if (name.tag != AX_STR) ax_fail("type error: env_get name");
+    const char *v = getenv(name.u.s);
+    return ax_str(v ? v : "");
+}
 /* end of Axiom runtime */

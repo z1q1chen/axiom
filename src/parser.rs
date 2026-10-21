@@ -118,6 +118,8 @@ impl<'a> Parser<'a> {
                 Tok::Struct => items.push(Item::Struct(self.parse_struct()?)),
                 Tok::Fn => items.push(Item::Fn(self.parse_fn(None)?)),
                 Tok::Impl => items.extend(self.parse_impl()?),
+                Tok::Extern => items.push(Item::Fn(self.parse_extern(None)?)),
+                Tok::Capability => items.extend(self.parse_capability()?),
                 Tok::Let => {
                     let (name, ann, expr, span) = self.parse_let_parts()?;
                     items.push(Item::Global(name, ann, expr, span));
@@ -257,6 +259,84 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // `capability Name { extern fn ...; ... }`: a named group of
+    // native bindings. Only extern declarations may appear inside.
+    fn parse_capability(&mut self) -> Result<Vec<Item>, String> {
+        self.expect(&Tok::Capability, "'capability'")?;
+        let (name, _) = self.ident()?;
+        self.expect(&Tok::LBrace, "'{'")?;
+        let mut items = Vec::new();
+        while *self.peek() == Tok::Extern {
+            items.push(Item::Fn(self.parse_extern(Some(name.clone()))?));
+        }
+        self.expect(&Tok::RBrace, "'}'")?;
+        Ok(items)
+    }
+
+    // `extern fn name(params) (-> type)? ;` or the same signature
+    // followed by a block holding only contract clauses.
+    fn parse_extern(&mut self, capability: Option<String>) -> Result<FnDef, String> {
+        let start = self.expect(&Tok::Extern, "'extern'")?.span;
+        self.expect(&Tok::Fn, "'fn'")?;
+        let (name, _) = self.ident()?;
+        self.expect(&Tok::LParen, "'('")?;
+        let mut params = Vec::new();
+        if *self.peek() != Tok::RParen {
+            loop {
+                let (pname, _) = self.ident()?;
+                self.expect(&Tok::Colon, "':'")?;
+                let ty = self.parse_type()?;
+                params.push((pname, ty));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RParen, "')'")?;
+        let ret = if self.eat(&Tok::Arrow) {
+            self.parse_type()?
+        } else {
+            TypeExpr::Void
+        };
+        let mut contracts = Vec::new();
+        if self.eat(&Tok::Semi) {
+            // No contracts.
+        } else {
+            self.expect(&Tok::LBrace, "'{' or ';'")?;
+            loop {
+                let kind = match self.peek() {
+                    Tok::Requires => ContractKind::Requires,
+                    Tok::Ensures => ContractKind::Ensures,
+                    Tok::RBrace => break,
+                    _ => {
+                        return self.err(
+                            "only contract clauses may appear in an extern fn block",
+                        )
+                    }
+                };
+                self.bump();
+                let e = self.parse_expr()?;
+                let text = self.text_of(e.span());
+                let span = e.span().clone();
+                self.expect(&Tok::Semi, "';'")?;
+                contracts.push(Contract { kind, expr: e, text, span });
+            }
+            self.expect(&Tok::RBrace, "'}'")?;
+        }
+        Ok(FnDef {
+            name,
+            type_params: Vec::new(),
+            params,
+            ret,
+            contracts,
+            body: Vec::new(),
+            span: start_span(&start, &self.file),
+            owner: None,
+            is_extern: true,
+            capability,
+        })
+    }
+
     fn parse_impl(&mut self) -> Result<Vec<Item>, String> {
         self.expect(&Tok::Impl, "'impl'")?;
         let (name, _) = self.ident()?;
@@ -316,7 +396,7 @@ impl<'a> Parser<'a> {
             contracts.push(Contract { kind, expr: e, text, span });
         }
         let body = self.parse_stmts_until_rbrace()?;
-        Ok(FnDef { name, type_params, params, ret, contracts, body, span: start_span(&start, &self.file), owner })
+        Ok(FnDef { name, type_params, params, ret, contracts, body, span: start_span(&start, &self.file), owner, is_extern: false, capability: None })
     }
 
     fn parse_stmts_until_rbrace(&mut self) -> Result<Vec<Stmt>, String> {

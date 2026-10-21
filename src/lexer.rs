@@ -26,6 +26,8 @@ pub enum Tok {
     Ensures,
     Check,
     Impl,
+    Extern,
+    Capability,
     LParen,
     RParen,
     LBrace,
@@ -205,6 +207,8 @@ pub fn lex(src: &str, file: &str) -> Result<Vec<Token>, String> {
                     "ensures" => Tok::Ensures,
                     "check" => Tok::Check,
                     "impl" => Tok::Impl,
+                    "extern" => Tok::Extern,
+                    "capability" => Tok::Capability,
                     _ => Tok::Ident(word.to_string()),
                 };
                 push(&mut toks, tok, i);

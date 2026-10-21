@@ -40,10 +40,13 @@ expect_out billing examples/billing/main.ax "ALL CLOSING BALANCES MATCH"
 expect_out methods examples/methods.ax "count is 3"
 expect_out interp examples/methods.ax "literal braces: {ok}"
 expect_out generics examples/generics.ax "first is 10 and x"
+expect_out files examples/files.ax "lines: alpha,beta,gamma,"
+expect_out joinrepl examples/files.ax "home set: true, exists: true"
 expect_out wordcount examples/wordcount.ax "the appears 4 times"
 expect_out maptests tests/map_basics.ax "map ok"
 expect_violation requires tests/violate_requires.ax "amt > 0"
 expect_violation invariant tests/violate_invariant.ax "balance >= 0"
+expect_violation extern tests/violate_extern.ax "len(path) > 0"
 
 if [ $fail -eq 0 ]; then
     echo "ALL TESTS PASS"

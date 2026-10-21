@@ -6,6 +6,18 @@ use std::collections::{HashMap, HashSet};
 
 const RUNTIME: &str = include_str!("../runtime/axiom_rt.c");
 
+// Names of extern functions whose native implementation
+// (axn_<name>) is missing from the runtime source.
+pub fn natives_missing(tp: &TProgram) -> Vec<String> {
+    let mut missing = Vec::new();
+    for f in &tp.fns {
+        if f.is_extern && !RUNTIME.contains(&format!("axn_{}(", f.name)) {
+            missing.push(f.name.clone());
+        }
+    }
+    missing
+}
+
 pub fn c_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for ch in s.chars() {
@@ -124,6 +136,21 @@ impl<'a> CodeGen<'a> {
                 if params.is_empty() { "void".to_string() } else { params }
             ));
         }
+        // Native prototypes for extern bindings (implemented by
+        // the runtime section above).
+        for f in &tp.fns {
+            if f.is_extern {
+                let params = (0..f.params.len())
+                    .map(|_| "AxVal")
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "static AxVal axn_{}({});\n",
+                    f.name,
+                    if params.is_empty() { "void".to_string() } else { params }
+                ));
+            }
+        }
         out.push('\n');
 
         // Globals.
@@ -177,6 +204,16 @@ impl<'a> CodeGen<'a> {
                     c.line
                 ));
             }
+        }
+        if f.is_extern {
+            // The body is the native call; contracts wrap it.
+            let args = f
+                .params
+                .iter()
+                .map(|(pname, _)| format!("v_{}", pname))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("    __result = axn_{}({});\n", f.name, args));
         }
         for stmt in &f.body {
             out.push_str(&self.gen_stmt(stmt, 1));
@@ -406,6 +443,8 @@ impl<'a> CodeGen<'a> {
                     "keys" => format!("ax_map_keys({})", parts[0]),
                     "del" => format!("ax_map_del({}, {})", parts[0], parts[1]),
                     "split" => format!("ax_split({}, {})", parts[0], parts[1]),
+                    "join" => format!("ax_join({}, {})", parts[0], parts[1]),
+                    "replace" => format!("ax_replace({}, {}, {})", parts[0], parts[1], parts[2]),
                     "raise" => format!("({{ ax_raise({}); ax_void(); }})", parts[0]),
                     _ => "ax_void()".to_string(),
                 }
