@@ -181,7 +181,7 @@ pub struct TProgram {
 
 const BUILTINS: &[&str] = &[
     "print", "len", "push", "range", "str", "int", "float", "raise", "has", "keys", "del",
-    "split", "join", "replace",
+    "split", "join", "replace", "substr", "index_of", "starts_with",
 ];
 
 struct FnSig {
@@ -1914,6 +1914,52 @@ impl Checker {
                     targs.push(t);
                 }
                 Ok(te(TExprKind::Builtin(name.into(), targs), Type::Str))
+            }
+            "substr" => {
+                if args.len() != 3 {
+                    return Err(arity("3", args.len()));
+                }
+                let s = self.check_expr(&args[0], Some(&Type::Str))?;
+                if s.ty != Type::Str {
+                    return self.err(span, "substr() needs a string first argument");
+                }
+                let mut targs = vec![s];
+                for a in &args[1..] {
+                    let t = self.check_expr(a, Some(&Type::Int))?;
+                    if t.ty != Type::Int {
+                        return self.err(span, "substr() start and length must be int");
+                    }
+                    targs.push(t);
+                }
+                Ok(te(TExprKind::Builtin(name.into(), targs), Type::Str))
+            }
+            "index_of" => {
+                if args.len() != 2 {
+                    return Err(arity("2", args.len()));
+                }
+                let mut targs = Vec::new();
+                for a in args {
+                    let t = self.check_expr(a, Some(&Type::Str))?;
+                    if t.ty != Type::Str {
+                        return self.err(span, "index_of() needs two strings");
+                    }
+                    targs.push(t);
+                }
+                Ok(te(TExprKind::Builtin(name.into(), targs), Type::Int))
+            }
+            "starts_with" => {
+                if args.len() != 2 {
+                    return Err(arity("2", args.len()));
+                }
+                let mut targs = Vec::new();
+                for a in args {
+                    let t = self.check_expr(a, Some(&Type::Str))?;
+                    if t.ty != Type::Str {
+                        return self.err(span, "starts_with() needs two strings");
+                    }
+                    targs.push(t);
+                }
+                Ok(te(TExprKind::Builtin(name.into(), targs), Type::Bool))
             }
             _ => self.err(span, &format!("unknown builtin '{}'", name)),
         }

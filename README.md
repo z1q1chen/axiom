@@ -13,7 +13,7 @@ program, and records every one of them in a **verification ledger**.
 
 ## Status
 
-v0.6, built 2026-10-21. A working language, not the full design
+v0.7, built 2026-10-21. A working language, not the full design
 proposal: the proof tier is on the roadmap in `DESIGN.md`, not in
 this build. Contracts are runtime-checked (bound for externs,
 bounded where `axiomc verify` has exhausted a domain), and the
@@ -42,6 +42,7 @@ builtin. See `examples/wordcount.ax`.
 cargo build --release          # builds axiomc
 ./target/release/axiomc run examples/hello.ax
 ./target/release/axiomc build examples/ledger/main.ax -o build/ledger
+./target/release/axiomc verify examples/verify_demo.ax   # bounded checking
 ./build/ledger                 # a double-entry bookkeeping system, in Axiom
 cat build/ledger.ledger.json   # the contracts it carries, with tiers
 ```
@@ -91,4 +92,16 @@ before it prints the trial balance.
 
 ```sh
 ./target/release/axiomc run examples/billing/main.ax
+```
+
+The third substantial example is `examples/rockstore/`: a
+log-structured key-value database (Bitcask-style) with an
+in-memory index, crash recovery by log replay, tombstone
+deletes, byte-exact space accounting, and compaction, driven
+by a small command line. It exists to prove a database can be
+built in Axiom on the `file` capability:
+
+```sh
+printf 'put name ziqi\nget name\nscan\nstats\nquit\n' \
+  | ./target/release/axiomc run examples/rockstore/main.ax
 ```

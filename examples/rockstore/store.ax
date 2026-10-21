@@ -1,0 +1,251 @@
+// RockStore: a log-structured key-value database written in
+// Axiom, in the Bitcask style. All writes append one text record
+// to a log file; an in-memory index maps each live key to the
+// sequence number of its latest record. Opening a store replays
+// the log and rebuilds the index, so a crash between processes
+// loses nothing that was appended. Compaction rewrites the log
+// with only live records.
+//
+// Record format, one per line:
+//   P <TAB> key <TAB> value <LF>     put
+//   D <TAB> key <LF>                 delete (tombstone)
+// Keys and values may not contain tab or newline (checked in
+// put). Numbers are bytes: Axiom string length is byte length,
+// so record lengths double as exact file offsets in the stats.
+
+capability file {
+    extern fn read_file(path: string) -> string {
+        requires len(path) > 0;
+    }
+    extern fn write_file(path: string, data: string) -> bool;
+    extern fn append_file(path: string, data: string) -> bool;
+    extern fn file_exists(path: string) -> bool;
+}
+
+capability io {
+    extern fn read_line() -> string;
+    extern fn env_get(name: string) -> string;
+}
+
+fn clean(s: string) -> bool {
+    return len(split(s, "\t")) == 1 && len(split(s, "\n")) == 1;
+}
+
+fn put_record(key: string, value: string) -> string {
+    return "P\t" + key + "\t" + value + "\n";
+}
+
+fn del_record(key: string) -> string {
+    return "D\t" + key + "\n";
+}
+
+struct Store {
+    path: string;
+    index: {string: int};
+    sizes: {string: int};
+    order: [string];
+    live: int;
+    live_bytes: int;
+    dead_bytes: int;
+    file_bytes: int;
+    next_seq: int;
+    puts: int;
+    gets: int;
+    dels: int;
+    // Step-wise invariants: true after every single field
+    // assignment, not just at rest. validate() checks the exact
+    // rest-state equalities.
+    invariant live >= 0 && live <= len(index);
+    invariant len(order) <= len(index);
+    invariant dead_bytes >= 0 && dead_bytes <= file_bytes;
+    invariant live_bytes >= 0 && live_bytes <= file_bytes;
+}
+
+fn open_store(path: string) -> Store {
+    if !file_exists(path) {
+        let ok = write_file(path, "");
+        check ok;
+    }
+    let st = Store {
+        path: path, index: {}, sizes: {}, order: [],
+        live: 0, live_bytes: 0, dead_bytes: 0, file_bytes: 0,
+        next_seq: 0, puts: 0, gets: 0, dels: 0
+    };
+    let content = read_file(path);
+    st.replay(content);
+    return st;
+}
+
+impl Store {
+    // Rebuild all in-memory state from log content. Also used by
+    // compaction right after the log is rewritten.
+    fn replay(self, content: string) {
+        let lines = split(content, "\n");
+        let i = 0;
+        while i < len(lines) {
+            let line = lines[i];
+            if len(line) > 0 {
+                let parts = split(line, "\t");
+                if parts[0] == "P" {
+                    check len(parts) == 3;
+                    self.apply_put(parts[1], len(line) + 1);
+                } else {
+                    check parts[0] == "D" && len(parts) == 2;
+                    self.apply_del(parts[1], len(line) + 1);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // The in-memory half of a put, shared by live writes and
+    // replay. Field updates are ordered so the invariants hold
+    // after each one.
+    fn apply_put(self, key: string, rec_len: int) {
+        let existed = has(self.index, key);
+        let old = 0;
+        if existed {
+            old = self.sizes[key];
+        }
+        self.index[key] = self.next_seq;
+        self.sizes[key] = rec_len;
+        self.file_bytes = self.file_bytes + rec_len;
+        if existed {
+            self.live_bytes = self.live_bytes - old + rec_len;
+            self.dead_bytes = self.dead_bytes + old;
+        } else {
+            self.live_bytes = self.live_bytes + rec_len;
+            self.live = self.live + 1;
+            push(self.order, key);
+        }
+        self.next_seq = self.next_seq + 1;
+    }
+
+    // The in-memory half of a delete. The key must exist.
+    fn apply_del(self, key: string, rec_len: int) {
+        let size = self.sizes[key];
+        self.live = self.live - 1;
+        del(self.index, key);
+        del(self.sizes, key);
+        let kept: [string] = [];
+        let i = 0;
+        while i < len(self.order) {
+            if self.order[i] != key {
+                push(kept, self.order[i]);
+            }
+            i = i + 1;
+        }
+        self.order = kept;
+        self.file_bytes = self.file_bytes + rec_len;
+        self.live_bytes = self.live_bytes - size;
+        self.dead_bytes = self.dead_bytes + size + rec_len;
+        self.next_seq = self.next_seq + 1;
+    }
+
+    fn has_key(self, key: string) -> bool {
+        return has(self.index, key);
+    }
+
+    fn put(self, key: string, value: string) -> bool {
+        requires len(key) > 0;
+        if !clean(key) || !clean(value) {
+            return false;
+        }
+        let rec = put_record(key, value);
+        let ok = append_file(self.path, rec);
+        check ok;
+        self.apply_put(key, len(rec));
+        self.puts = self.puts + 1;
+        return true;
+    }
+
+    fn remove(self, key: string) -> bool {
+        if !has(self.index, key) {
+            return false;
+        }
+        let rec = del_record(key);
+        let ok = append_file(self.path, rec);
+        check ok;
+        self.apply_del(key, len(rec));
+        self.dels = self.dels + 1;
+        return true;
+    }
+
+    fn read_value(self, key: string) -> string {
+        let seq = self.index[key];
+        let content = read_file(self.path);
+        let lines = split(content, "\n");
+        let parts = split(lines[seq], "\t");
+        check parts[0] == "P" && parts[1] == key;
+        return parts[2];
+    }
+
+    fn get(self, key: string) -> string {
+        requires has(self.index, key);
+        self.gets = self.gets + 1;
+        return self.read_value(key);
+    }
+
+    fn scan(self, prefix: string) -> [string] {
+        let out: [string] = [];
+        let i = 0;
+        while i < len(self.order) {
+            let k = self.order[i];
+            if starts_with(k, prefix) {
+                push(out, k + "=" + self.read_value(k));
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Rewrite the log with only the live records, then rebuild
+    // the index from the new content. Crash note: write_file is
+    // a single truncate-and-write, not an atomic swap; a crash
+    // mid-compaction can lose the log. Live puts stay append-only
+    // and crash-safe.
+    fn compact(self) {
+        let lines: [string] = [];
+        let i = 0;
+        while i < len(self.order) {
+            let k = self.order[i];
+            push(lines, put_record(k, self.read_value(k)));
+            i = i + 1;
+        }
+        let content = join(lines, "");
+        let ok = write_file(self.path, content);
+        check ok;
+        self.reset_state();
+        self.replay(content);
+    }
+
+    fn reset_state(self) {
+        let empty_index: {string: int} = {};
+        let empty_sizes: {string: int} = {};
+        let empty_order: [string] = [];
+        self.live = 0;
+        self.order = empty_order;
+        self.index = empty_index;
+        self.sizes = empty_sizes;
+        self.dead_bytes = 0;
+        self.live_bytes = 0;
+        self.file_bytes = 0;
+        self.next_seq = 0;
+    }
+
+    // Rest-state audit: exact equalities the invariants only
+    // bound, plus the file on disk agrees with the bookkeeping.
+    fn validate(self) -> bool {
+        check self.live == len(self.index);
+        check self.live == len(self.sizes);
+        check self.live == len(self.order);
+        check self.dead_bytes + self.live_bytes == self.file_bytes;
+        let content = read_file(self.path);
+        check len(content) == self.file_bytes;
+        return true;
+    }
+
+    fn stats(self) -> string {
+        return "live={self.live} puts={self.puts} gets={self.gets} dels={self.dels} file_bytes={self.file_bytes} dead_bytes={self.dead_bytes}";
+    }
+}

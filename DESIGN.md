@@ -103,7 +103,10 @@ for the roadmap and are never claimed by this compiler.
 `push(arr, v)` (mutates, returns the array), `range(n)` /
 `range(a, b)` (array of ints), `str(x)`, `int(x)`, `float(x)`,
 `raise(msg)` (stop with a message), `has(m, k)`, `keys(m)`,
-`del(m, k)` (returns the map), `split(s, sep)` (array of strings).
+`del(m, k)` (returns the map), `split(s, sep)` (array of strings),
+`join(parts, sep)`, `replace(s, from, to)`, `substr(s, start, n)`
+(clamped to bounds), `index_of(s, sub)` (-1 when absent),
+`starts_with(s, prefix)`.
 
 ## Equality
 

@@ -1,0 +1,82 @@
+// RockStore command line. The database file comes from the
+// ROCKSTORE_PATH environment variable (default /tmp/rockstore.db).
+// Commands, one per line:
+//   put <key> <value...>   get <key>   del <key>   has <key>
+//   scan [prefix]          stats       compact     validate
+//   quit                   (end of input also ends the session)
+// Values may contain spaces. An empty input line ends the
+// session, like EOF.
+
+use "store.ax";
+
+fn main() {
+    let path = env_get("ROCKSTORE_PATH");
+    if len(path) == 0 {
+        path = "/tmp/rockstore.db";
+    }
+    let st = open_store(path);
+    while true {
+        let line = read_line();
+        if len(line) == 0 || line == "quit" {
+            break;
+        }
+        handle(st, line);
+    }
+}
+
+fn handle(st: Store, line: string) {
+    let sp = index_of(line, " ");
+    let cmd = line;
+    let rest = "";
+    if sp >= 0 {
+        cmd = substr(line, 0, sp);
+        rest = substr(line, sp + 1, len(line) - sp - 1);
+    }
+    if cmd == "put" {
+        let sp2 = index_of(rest, " ");
+        if sp2 < 0 {
+            print("ERR put needs a key and a value");
+            return;
+        }
+        let key = substr(rest, 0, sp2);
+        let value = substr(rest, sp2 + 1, len(rest) - sp2 - 1);
+        if st.put(key, value) {
+            print("OK");
+        } else {
+            print("ERR keys and values must not contain tab or newline");
+        }
+    } else if cmd == "get" {
+        if st.has_key(rest) {
+            print(st.get(rest));
+        } else {
+            print("(nil)");
+        }
+    } else if cmd == "del" {
+        if st.remove(rest) {
+            print("OK");
+        } else {
+            print("(not found)");
+        }
+    } else if cmd == "has" {
+        print(st.has_key(rest));
+    } else if cmd == "scan" {
+        let rows = st.scan(rest);
+        let i = 0;
+        while i < len(rows) {
+            print(rows[i]);
+            i = i + 1;
+        }
+        print("({len(rows)} keys)");
+    } else if cmd == "stats" {
+        print(st.stats());
+    } else if cmd == "compact" {
+        let before = st.dead_bytes;
+        st.compact();
+        print("compacted: dead_bytes {before} -> {st.dead_bytes}");
+    } else if cmd == "validate" {
+        st.validate();
+        print("VALID");
+    } else {
+        print("ERR unknown command");
+    }
+}

@@ -79,6 +79,20 @@ expect_violation extern tests/violate_extern.ax "len(path) > 0"
 expect_verify_ok verifydemo examples/verify_demo.ax
 expect_verify_counterexample verifyce tests/verify_counterexample.ax "counterexample: bump(-3)"
 
+# RockStore: two processes over one database file prove
+# append, replay recovery, delete, and compaction.
+rm -f /tmp/rockstore_test.db
+printf 'put a 1\nput b 2\nput a 3\nquit\n' | ROCKSTORE_PATH=/tmp/rockstore_test.db $AX run examples/rockstore/main.ax > /tmp/rs.out 2>/dev/null
+printf 'get a\ndel b\ncompact\nvalidate\nquit\n' | ROCKSTORE_PATH=/tmp/rockstore_test.db $AX run examples/rockstore/main.ax >> /tmp/rs.out 2>/dev/null
+if grep -q "^3$" /tmp/rs.out && grep -q "compacted: dead_bytes" /tmp/rs.out && grep -q "^VALID$" /tmp/rs.out; then
+    echo "PASS rockstore"
+else
+    echo "FAIL rockstore:"
+    cat /tmp/rs.out
+    fail=1
+fi
+rm -f /tmp/rockstore_test.db
+
 if [ $fail -eq 0 ]; then
     echo "ALL TESTS PASS"
 else

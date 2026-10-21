@@ -451,6 +451,9 @@ impl<'a> CodeGen<'a> {
                     "split" => format!("ax_split({}, {})", parts[0], parts[1]),
                     "join" => format!("ax_join({}, {})", parts[0], parts[1]),
                     "replace" => format!("ax_replace({}, {}, {})", parts[0], parts[1], parts[2]),
+                    "substr" => format!("ax_substr({}, ({}).u.i, ({}).u.i)", parts[0], parts[1], parts[2]),
+                    "index_of" => format!("ax_int(ax_index_of({}, {}))", parts[0], parts[1]),
+                    "starts_with" => format!("ax_bool(ax_starts_with({}, {}))", parts[0], parts[1]),
                     "raise" => format!("({{ ax_raise({}); ax_void(); }})", parts[0]),
                     _ => "ax_void()".to_string(),
                 }

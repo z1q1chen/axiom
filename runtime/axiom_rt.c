@@ -442,6 +442,29 @@ static AxVal ax_replace(AxVal s, AxVal from, AxVal to) {
     AxVal r; r.tag = AX_STR; r.u.s = out; return r;
 }
 
+static AxVal ax_substr(AxVal s, int64_t start, int64_t n) {
+    if (s.tag != AX_STR) ax_fail("type error: substr() on non-string");
+    int64_t len = (int64_t)strlen(s.u.s);
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    if (n < 0) n = 0;
+    if (start + n > len) n = len - start;
+    AxVal r; r.tag = AX_STR; r.u.s = ax_dup_range(s.u.s + start, (size_t)n);
+    return r;
+}
+static int64_t ax_index_of(AxVal s, AxVal sub) {
+    if (s.tag != AX_STR || sub.tag != AX_STR)
+        ax_fail("type error: index_of() needs two strings");
+    if (sub.u.s[0] == 0) return 0;
+    const char *hit = strstr(s.u.s, sub.u.s);
+    return hit ? (int64_t)(hit - s.u.s) : -1;
+}
+static int ax_starts_with(AxVal s, AxVal prefix) {
+    if (s.tag != AX_STR || prefix.tag != AX_STR)
+        ax_fail("type error: starts_with() needs two strings");
+    return strncmp(s.u.s, prefix.u.s, strlen(prefix.u.s)) == 0;
+}
+
 /* ---- native bindings (extern fn implementations) ----
    Every `extern fn name(...)` in Axiom binds to axn_name here.
    axiomc refuses to build when one is missing. */
