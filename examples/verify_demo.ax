@@ -1,0 +1,33 @@
+// v0.6: bounded verification demo. `axiomc verify` calls these
+// pure functions on every input in a bounded domain (literals
+// from requires join the domain) and hunts for counterexamples.
+
+fn clamp(x: int, lo: int, hi: int) -> int {
+    requires lo <= hi;
+    ensures result >= lo && result <= hi;
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+fn abs_val(n: int) -> int {
+    ensures result >= 0;
+    ensures n > 0 || result == 0 - n || n == 0 || result == n;
+    if n < 0 {
+        return 0 - n;
+    }
+    return n;
+}
+
+fn is_even(n: int) -> bool {
+    ensures result == (n % 2 == 0);
+    return n % 2 == 0;
+}
+
+fn main() {
+    print(clamp(15, 0, 10));
+}

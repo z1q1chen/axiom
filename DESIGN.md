@@ -161,9 +161,32 @@ Shipped natives: capability `file` (read_file, write_file,
 append_file, file_exists) and `io` (read_line, env_get). Builtins
 `join` and `replace` also arrived in v0.5.
 
+## Bounded verification (v0.6)
+
+`axiomc verify <file>` is the first tier above runtime-checked.
+For every eligible function it generates a harness that calls the
+function on every combination of a bounded input domain, in a
+forked child per case. Inputs that fail `requires` are excluded;
+a case that passes `requires` and then fails any contract (or
+crashes) is a counterexample, printed with its concrete inputs.
+
+Eligible: pure functions (no extern calls, no print/raise, no
+mutation of globals, fields, arrays, or maps, directly or through
+callees; purity is computed to a fixpoint over the call graph)
+with only int/bool parameters and int/bool/void returns. The int
+domain is -3..3 plus, per parameter, every literal (and its
+neighbours) that the function's `requires` compares it against.
+Combinations are capped (domains shrink to -1..1 past 20,000
+combinations; beyond that the function is reported skipped).
+
+`verify` writes `<program>.verify.json`: functions with zero
+counterexamples are recorded at tier **bounded** — proven for
+the stated domain, not for all inputs — and the rest stay
+runtime-checked. Functions that are not eligible are absent
+from the report and stay runtime-checked too.
+
 ## Roadmap (not in v0.1)
 
-- Contract tiers above runtime-checked: bounded model checking of
-  small pure functions; proof for a tiny critical core.
+- Proof for a tiny critical core (the tier above bounded).
 - Freeing memory (a real allocator policy), separate compilation.
 - Trait bounds for generic parameters; generic methods.

@@ -1,0 +1,10 @@
+// bump breaks its ensures on every input: verify must find
+// counterexamples and fail.
+fn bump(x: int) -> int {
+    ensures result > x;
+    return x;
+}
+
+fn main() {
+    print(bump(1));
+}

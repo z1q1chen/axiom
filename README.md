@@ -13,12 +13,16 @@ program, and records every one of them in a **verification ledger**.
 
 ## Status
 
-v0.5, built 2026-10-21. A working language, not the full design
+v0.6, built 2026-10-21. A working language, not the full design
 proposal: the proof tier is on the roadmap in `DESIGN.md`, not in
-this build. Contracts are runtime-checked (or bound, for externs),
-and the ledger says exactly that.
+this build. Contracts are runtime-checked (bound for externs,
+bounded where `axiomc verify` has exhausted a domain), and the
+ledger and verify report say exactly that.
 
-v0.5 adds extern functions and capability binding: `extern fn`
+v0.6 adds `axiomc verify`: bounded exhaustive checking of pure
+int/bool functions, with counterexamples and a verify report at
+tier `bounded`. See `examples/verify_demo.ax`. v0.5 added extern
+functions and capability binding: `extern fn`
 binds to a native runtime implementation, grouped by
 `capability` blocks, contracts checked at the boundary, ledger
 tier `bound`. Shipped natives cover files and stdin/env; builtins

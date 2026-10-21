@@ -32,6 +32,35 @@ expect_violation() {
     fi
 }
 
+expect_verify_ok() {
+    name="$1"; file="$2"
+    rm -f ./*.verify.json
+    if $AX verify "$file" > /tmp/axv.out 2>&1 && grep -q "VERIFY OK (bounded)" /tmp/axv.out; then
+        echo "PASS $name"
+    else
+        echo "FAIL $name: verify did not report BOUNDED OK:"
+        cat /tmp/axv.out
+        fail=1
+    fi
+    rm -f ./*.verify.json
+}
+
+expect_verify_counterexample() {
+    name="$1"; file="$2"; want="$3"
+    rm -f ./*.verify.json
+    if $AX verify "$file" > /tmp/axv.out 2>&1; then
+        echo "FAIL $name: verify unexpectedly passed"
+        fail=1
+    elif grep -q "$want" /tmp/axv.out; then
+        echo "PASS $name"
+    else
+        echo "FAIL $name: no counterexample found in output:"
+        cat /tmp/axv.out
+        fail=1
+    fi
+    rm -f ./*.verify.json
+}
+
 expect_out hello examples/hello.ax "total: 10"
 expect_out fib examples/fib.ax "10 55"
 expect_out transfer examples/transfer.ax "cash 70"
@@ -47,6 +76,8 @@ expect_out maptests tests/map_basics.ax "map ok"
 expect_violation requires tests/violate_requires.ax "amt > 0"
 expect_violation invariant tests/violate_invariant.ax "balance >= 0"
 expect_violation extern tests/violate_extern.ax "len(path) > 0"
+expect_verify_ok verifydemo examples/verify_demo.ax
+expect_verify_counterexample verifyce tests/verify_counterexample.ax "counterexample: bump(-3)"
 
 if [ $fail -eq 0 ]; then
     echo "ALL TESTS PASS"

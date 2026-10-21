@@ -47,6 +47,7 @@ fn main() {
         "check" => cmd_check(&file),
         "build" => cmd_build(&file, out.as_deref(), emit_c, false),
         "run" => cmd_build(&file, out.as_deref(), emit_c, true),
+        "verify" => cmd_verify(&file),
         _ => {
             usage();
             exit(2);
@@ -63,6 +64,7 @@ fn usage() {
     eprintln!("  axiomc build <file.ax> [-o <out>] [--emit-c]");
     eprintln!("  axiomc run   <file.ax>");
     eprintln!("  axiomc check <file.ax>");
+    eprintln!("  axiomc verify <file.ax>");
 }
 
 /// Load the entry file and everything it `use`s, merged into one Program.
@@ -185,6 +187,110 @@ fn cmd_check(file: &str) -> Result<(), String> {
         tp.structs.len(),
         count_contracts(&tp)
     );
+    Ok(())
+}
+
+/// Bounded exhaustive verification: build a harness that calls
+/// every eligible pure function on every combination of a bounded
+/// input domain and reports counterexamples. Writes
+/// <stem>.verify.json with per-function results at tier "bounded"
+/// for functions with no counterexample.
+fn cmd_verify(file: &str) -> Result<(), String> {
+    let (tp, _) = compile(file)?;
+    let plan = codegen::verify_plan(&tp);
+    if plan.is_empty() {
+        println!(
+            "verify: no eligible functions (need pure functions with int/bool parameters)"
+        );
+        return Ok(());
+    }
+    let stem = Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "program".to_string());
+    let c_src = codegen::CodeGen::new(&tp).gen_verify_program(&tp, &plan);
+    let dir = std::env::temp_dir().join(format!("axiomc-verify-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let c_path = dir.join(format!("{}.verify.c", stem));
+    let bin_path = dir.join(format!("{}-verify", stem));
+    std::fs::write(&c_path, &c_src).map_err(|e| e.to_string())?;
+    let cc_out = std::process::Command::new("cc")
+        .args(["-O2", "-std=gnu99", "-w", "-o"])
+        .arg(&bin_path)
+        .arg(&c_path)
+        .output()
+        .map_err(|e| format!("cannot run cc: {}", e))?;
+    if !cc_out.status.success() {
+        return Err(format!(
+            "C compilation of the verify harness failed:\n{}",
+            String::from_utf8_lossy(&cc_out.stderr)
+        ));
+    }
+    let run = std::process::Command::new(&bin_path)
+        .output()
+        .map_err(|e| format!("cannot run verify harness: {}", e))?;
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    print!("{}", stdout);
+    if !run.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&run.stderr));
+    }
+    // Assemble the verify report from the VERIFY lines.
+    let mut results: Vec<String> = Vec::new();
+    let mut any_fail = false;
+    for line in stdout.lines() {
+        let rest = match line.strip_prefix("VERIFY fn=") {
+            Some(r) => r,
+            None => continue,
+        };
+        let mut fields: Vec<(&str, &str)> = Vec::new();
+        let mut name = "";
+        for tok in rest.split(' ') {
+            if let Some((k, v)) = tok.split_once('=') {
+                fields.push((k, v));
+            } else {
+                name = tok;
+            }
+        }
+        let get = |k: &str| {
+            fields
+                .iter()
+                .find(|(fk, _)| *fk == k)
+                .map(|(_, v)| *v)
+                .unwrap_or("0")
+        };
+        if fields.iter().any(|(k, _)| *k == "skipped") {
+            results.push(format!(
+                "    {{\"fn\": \"{}\", \"skipped\": \"{}\", \"tier\": \"runtime-checked\"}}",
+                codegen::c_escape(name),
+                codegen::c_escape(get("skipped"))
+            ));
+            continue;
+        }
+        let failed: i64 = get("failed").parse().unwrap_or(0);
+        if failed > 0 {
+            any_fail = true;
+        }
+        results.push(format!(
+            "    {{\"fn\": \"{}\", \"cases\": {}, \"excluded\": {}, \"passed\": {}, \"failed\": {}, \"tier\": \"{}\"}}",
+            codegen::c_escape(name),
+            get("cases"),
+            get("excluded"),
+            get("passed"),
+            get("failed"),
+            if failed == 0 { "bounded" } else { "runtime-checked" }
+        ));
+    }
+    let report = format!(
+        "{{\n  \"program\": \"{}\",\n  \"results\": [\n{}\n  ]\n}}\n",
+        codegen::c_escape(&stem),
+        results.join(",\n")
+    );
+    let report_path = format!("{}.verify.json", stem);
+    std::fs::write(&report_path, &report).map_err(|e| e.to_string())?;
+    println!("verify report: {}", report_path);
+    if any_fail || !run.status.success() {
+        return Err("verify found counterexamples (see above)".to_string());
+    }
     Ok(())
 }
 
