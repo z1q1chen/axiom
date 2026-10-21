@@ -1,0 +1,42 @@
+// Reports. The trial balance is the system's compositional invariant,
+// checked line by line: the sum of debit-normal balances must equal the
+// sum of credit-normal balances. Not a total pulled from thin air: it is
+// recomputed from every account, every time.
+use "types.ax";
+use "journal.ax";
+
+fn trial_balance(accounts: [Account]) {
+    print("== trial balance ==");
+    let dr_total = 0;
+    let cr_total = 0;
+    for a in accounts {
+        print(a.id, a.name, a.kind, a.balance);
+        if is_debit_normal(a) {
+            dr_total = dr_total + a.balance;
+        } else {
+            cr_total = cr_total + a.balance;
+        }
+    }
+    print("debit-normal total:", dr_total);
+    print("credit-normal total:", cr_total);
+    check dr_total == cr_total;
+    print("TRIAL BALANCE OK");
+}
+
+// The per-account ledger: every posted entry line that touched this
+// account, in order. This is the line-item view, the one a human can
+// actually audit.
+fn statement(accounts: [Account], entries: [JournalEntry], account: int) {
+    let a = accounts[account];
+    print("== statement:", a.name, "==");
+    for e in entries {
+        if e.state != 0 {
+            for line in e.lines {
+                if line.account == account {
+                    print("entry", e.id, e.memo, "dr", line.debit, "cr", line.credit);
+                }
+            }
+        }
+    }
+    print("balance:", a.balance);
+}

@@ -1,0 +1,88 @@
+// Journal mechanics: build entries, post them, reverse them.
+use "types.ax";
+
+fn new_entry(id: int, memo: string) -> JournalEntry {
+    return JournalEntry { id: id, memo: memo, state: 0, lines: [] };
+}
+
+fn add_line(e: JournalEntry, account: int, debit: int, credit: int) -> JournalEntry {
+    requires e.state == 0;
+    requires debit >= 0;
+    requires credit >= 0;
+    push(e.lines, EntryLine { account: account, debit: debit, credit: credit });
+    return e;
+}
+
+fn total_debits(e: JournalEntry) -> int {
+    let total = 0;
+    for line in e.lines {
+        total = total + line.debit;
+    }
+    return total;
+}
+
+fn total_credits(e: JournalEntry) -> int {
+    let total = 0;
+    for line in e.lines {
+        total = total + line.credit;
+    }
+    return total;
+}
+
+fn is_debit_normal(a: Account) -> bool {
+    return a.kind == "asset" || a.kind == "expense";
+}
+
+fn apply_line(accounts: [Account], line: EntryLine) {
+    let a = accounts[line.account];
+    if line.debit > 0 {
+        if is_debit_normal(a) {
+            a.balance = a.balance + line.debit;
+        } else {
+            a.balance = a.balance - line.debit;
+        }
+    }
+    if line.credit > 0 {
+        if is_debit_normal(a) {
+            a.balance = a.balance - line.credit;
+        } else {
+            a.balance = a.balance + line.credit;
+        }
+    }
+}
+
+// Post a draft entry. Unbalanced entries are rejected (return false,
+// state stays draft). A posted entry has moved every account it touches,
+// and each account invariant stood guard on every single step.
+fn post(e: JournalEntry, accounts: [Account]) -> bool {
+    requires e.state == 0;
+    requires len(e.lines) >= 2;
+    ensures result == false || e.state == 1;
+    if total_debits(e) != total_credits(e) {
+        return false;
+    }
+    for line in e.lines {
+        apply_line(accounts, line);
+    }
+    e.state = 1;
+    return true;
+}
+
+fn make_reversal(e: JournalEntry, new_id: int) -> JournalEntry {
+    requires e.state == 1;
+    let r = new_entry(new_id, "reversal of #" + str(e.id) + ": " + e.memo);
+    for line in e.lines {
+        add_line(r, line.account, line.credit, line.debit);
+    }
+    return r;
+}
+
+fn reverse(e: JournalEntry, accounts: [Account], new_id: int) -> JournalEntry {
+    requires e.state == 1;
+    ensures e.state == 2;
+    let r = make_reversal(e, new_id);
+    let ok = post(r, accounts);
+    check ok;
+    e.state = 2;
+    return r;
+}

@@ -1,0 +1,30 @@
+// Double-entry bookkeeping: core types.
+// Amounts are whole dollars (int). Every account balance is kept on its
+// normal side, so a balance can never go negative: the invariant is a
+// real business rule (no overdrafts, no negative revenue).
+
+struct Account {
+    id: int;
+    name: string;
+    kind: string;   // asset | expense = debit-normal; liability | equity | revenue = credit-normal
+    balance: int;
+    invariant balance >= 0;
+}
+
+struct EntryLine {
+    account: int;   // index into the accounts array
+    debit: int;
+    credit: int;
+    invariant debit >= 0;
+    invariant credit >= 0;
+    invariant debit == 0 || credit == 0;   // a line is one-sided
+}
+
+struct JournalEntry {
+    id: int;
+    memo: string;
+    state: int;     // 0 = draft, 1 = posted, 2 = reversed
+    lines: [EntryLine];
+    invariant state >= 0;
+    invariant state <= 2;
+}

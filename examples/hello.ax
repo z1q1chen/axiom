@@ -1,0 +1,16 @@
+fn main() {
+    print("hello from axiom");
+    let xs = [1, 2, 3];
+    push(xs, 4);
+    print("len:", len(xs));
+    let total = 0;
+    for x in xs {
+        total = total + x;
+    }
+    print("total:", total);
+    let s = "";
+    for i in range(3) {
+        s = s + str(i);
+    }
+    print("digits:", s);
+}

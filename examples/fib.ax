@@ -1,0 +1,13 @@
+fn fib(n: int) -> int {
+    requires n >= 0;
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() {
+    for i in range(11) {
+        print(i, fib(i));
+    }
+}

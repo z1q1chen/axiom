@@ -1,0 +1,12 @@
+// Expected: contract violation (invariant balance >= 0), exit code 70.
+struct Account {
+    name: string;
+    balance: int;
+    invariant balance >= 0;
+}
+
+fn main() {
+    let a = Account { name: "cash", balance: 10 };
+    a.balance = 0 - 1;
+    print("should not reach here");
+}

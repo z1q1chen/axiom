@@ -1,0 +1,61 @@
+// A small business, one month of books, in Axiom.
+// Run: axiomc run examples/ledger/main.ax
+use "types.ax";
+use "journal.ax";
+use "reports.ax";
+
+fn open_account(accounts: [Account], id: int, name: string, kind: string) {
+    push(accounts, Account { id: id, name: name, kind: kind, balance: 0 });
+}
+
+fn main() {
+    let accounts: [Account] = [];
+    open_account(accounts, 0, "Cash", "asset");
+    open_account(accounts, 1, "Equipment", "asset");
+    open_account(accounts, 2, "Capital", "equity");
+    open_account(accounts, 3, "Sales", "revenue");
+    open_account(accounts, 4, "Rent", "expense");
+
+    let entries: [JournalEntry] = [];
+
+    let e1 = new_entry(1, "owner investment");
+    add_line(e1, 0, 100000, 0);
+    add_line(e1, 2, 0, 100000);
+    check post(e1, accounts);
+    push(entries, e1);
+
+    let e2 = new_entry(2, "buy equipment");
+    add_line(e2, 1, 30000, 0);
+    add_line(e2, 0, 0, 30000);
+    check post(e2, accounts);
+    push(entries, e2);
+
+    let e3 = new_entry(3, "cash sale");
+    add_line(e3, 0, 12000, 0);
+    add_line(e3, 3, 0, 12000);
+    check post(e3, accounts);
+    push(entries, e3);
+
+    let e4 = new_entry(4, "pay rent");
+    add_line(e4, 4, 2500, 0);
+    add_line(e4, 0, 0, 2500);
+    check post(e4, accounts);
+    push(entries, e4);
+
+    // An unbalanced entry must be refused, and stay a draft.
+    let bad = new_entry(5, "unbalanced attempt");
+    add_line(bad, 0, 500, 0);
+    add_line(bad, 3, 0, 400);
+    let accepted = post(bad, accounts);
+    print("unbalanced entry accepted:", accepted);
+    check accepted == false;
+    check bad.state == 0;
+
+    // Refund the sale: reverse entry 3 with a new entry, mark it reversed.
+    let rev = reverse(e3, accounts, 6);
+    push(entries, rev);
+    print("entry 3 state after reversal:", e3.state);
+
+    trial_balance(accounts);
+    statement(accounts, entries, 0);
+}

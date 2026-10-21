@@ -1,0 +1,22 @@
+struct Account {
+    name: string;
+    balance: int;
+    invariant balance >= 0;
+}
+
+fn transfer(from: Account, to: Account, amt: int) -> bool {
+    requires amt > 0;
+    requires from.balance >= amt;
+    ensures from.balance >= 0;
+    from.balance = from.balance - amt;
+    to.balance = to.balance + amt;
+    return true;
+}
+
+fn main() {
+    let a = Account { name: "cash", balance: 100 };
+    let b = Account { name: "sales", balance: 0 };
+    transfer(a, b, 30);
+    print(a.name, a.balance);
+    print(b.name, b.balance);
+}
