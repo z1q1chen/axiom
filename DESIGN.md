@@ -203,6 +203,23 @@ type still rechecks everything even though only changed
 modules need their C recompiled (the driver currently rebuilds
 all objects; it does not do make-style staleness).
 
+## The ideal form: intent-first, target-agnostic (v0.12)
+
+Building the language version surfaced the load-bearing
+fact: the compulsion to state guarantees lives in the intent
+loop's workflow, not in the target language's syntax. The
+v0.12 tool (`tools/axiom-intent/`) is that form. The intent
+file is the only source of truth; Rust is a generated,
+hash-locked artifact (out-of-loop edits are detected as
+BYPASSED); contracts declared at intent level are lowered
+into the artifact; a property with no evidence fails the
+build unless the intent file carries a signed acceptance.
+Tiers and accepted-risk reporting work exactly as in the
+language version — because they were never about the
+language. The .ax toolchain remains the mechanism
+laboratory and the intent layer's first target; this is the
+shape the design points at when it grows up.
+
 ## The intent layer (v0.11)
 
 The language checks contracts; `tools/intent/` is the layer

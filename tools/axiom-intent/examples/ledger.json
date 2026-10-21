@@ -1,0 +1,189 @@
+{
+ "module": "coupon2",
+ "contracts": [
+  {
+   "kind": "invariant",
+   "owner": "Discount",
+   "text": "total == percent_part + fixed_part && percent_part >= 0 && fixed_part >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "percent_discount",
+   "text": "subtotal >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "percent_discount",
+   "text": "pct >= 0 && pct <= 100",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "ensures",
+   "owner": "percent_discount",
+   "text": "result >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "ensures",
+   "owner": "percent_discount",
+   "text": "result <= subtotal",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "discount_for",
+   "text": "subtotal >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "discount_for",
+   "text": "value >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "discount_for",
+   "text": "kind == 0 || kind == 1",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "ensures",
+   "owner": "discount_for",
+   "text": "result.total == result.percent_part + result.fixed_part",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "ensures",
+   "owner": "discount_for",
+   "text": "result.total >= 0 && result.total <= subtotal",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "final_price",
+   "text": "subtotal >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "final_price",
+   "text": "value >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "final_price",
+   "text": "kind == 0 || kind == 1",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "ensures",
+   "owner": "final_price",
+   "text": "result >= 0 && result <= subtotal",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "check_eligible",
+   "text": "subtotal >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "check_eligible",
+   "text": "threshold >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "check_eligible",
+   "text": "uses >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "requires",
+   "owner": "check_eligible",
+   "text": "limit >= 0",
+   "tier": "runtime-checked"
+  },
+  {
+   "kind": "ensures",
+   "owner": "check_eligible",
+   "text": "result >= 0 && result <= 4",
+   "tier": "runtime-checked"
+  }
+ ],
+ "functions": [
+  {
+   "name": "percent_discount",
+   "requires": 2,
+   "ensures": 2
+  },
+  {
+   "name": "discount_for",
+   "requires": 3,
+   "ensures": 2
+  },
+  {
+   "name": "final_price",
+   "requires": 3,
+   "ensures": 1
+  },
+  {
+   "name": "check_eligible",
+   "requires": 4,
+   "ensures": 1
+  }
+ ],
+ "integrity": "IN-LOOP",
+ "results": {
+  "total_bounds": {
+   "tier": "runtime-checked",
+   "result": "PASS",
+   "note": "scenario snippet against generated Rust"
+  },
+  "line_items": {
+   "tier": "runtime-checked",
+   "result": "PASS",
+   "note": "scenario snippet against generated Rust"
+  },
+  "threshold_error": {
+   "tier": "runtime-checked",
+   "result": "PASS",
+   "note": "scenario snippet against generated Rust"
+  },
+  "stacking": {
+   "tier": "runtime-checked",
+   "result": "PASS",
+   "note": "scenario snippet against generated Rust"
+  },
+  "expiry_boundary": {
+   "tier": "runtime-checked",
+   "result": "PASS",
+   "note": "scenario snippet against generated Rust"
+  },
+  "user_limit": {
+   "tier": "runtime-checked",
+   "result": "PASS",
+   "note": "scenario snippet against generated Rust"
+  },
+  "percent_cap": {
+   "tier": "runtime-checked",
+   "result": "PASS",
+   "note": "scenario snippet against generated Rust"
+  },
+  "percent_discount_bounds": {
+   "tier": "bounded",
+   "result": "PASS",
+   "note": "exhausted: 420 cases, 580 excluded by requires"
+  },
+  "refund_rule": {
+   "tier": "none",
+   "result": "UNCHECKED (accepted)",
+   "note": "退款流程在店面层实现，不在本模块。风险由店面层测试承担，此处签字接受无证据。"
+  }
+ }
+}

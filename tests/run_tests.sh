@@ -103,6 +103,20 @@ else
     fail=1
 fi
 
+# Ideal form: intent-first toolchain targeting Rust. The
+# coupon2 example must pass all evidenced properties, refuse
+# nothing (its one unchecked property is signed), and the
+# generated artifact must verify as IN-LOOP.
+ideal_out="$(python3 tools/axiom-intent/axiomi.py build tools/axiom-intent/examples/coupon2.intent.json 2>&1)"
+ideal_check="$(python3 tools/axiom-intent/axiomi.py check tools/axiom-intent/examples/coupon2.intent.json 2>&1)"
+if printf '%s' "$ideal_out" | grep -q "8 passed, 0 failed" \
+    && printf '%s' "$ideal_check" | grep -q "IN-LOOP"; then
+    echo "PASS ideal"
+else
+    echo "FAIL ideal: $ideal_out / $ideal_check"
+    fail=1
+fi
+
 # Billing API: build the server, drive it with curl, and check
 # the books through its own trial-balance endpoint.
 $AX build examples/billing_api/api.ax -o /tmp/axapi_test >/dev/null 2>&1
