@@ -93,6 +93,16 @@ else
 fi
 rm -f /tmp/rockstore_test.db
 
+# Intent layer: the coupon example must evidence all 8
+# properties (7 scenario + 1 bounded), none unchecked.
+intent_out="$(python3 tools/intent/intentc.py tools/intent/examples/coupon.intent.json 2>&1)"
+if printf '%s' "$intent_out" | grep -q "8 passed, 0 failed, 0 unchecked"; then
+    echo "PASS intent"
+else
+    echo "FAIL intent: $intent_out"
+    fail=1
+fi
+
 # Billing API: build the server, drive it with curl, and check
 # the books through its own trial-balance endpoint.
 $AX build examples/billing_api/api.ax -o /tmp/axapi_test >/dev/null 2>&1

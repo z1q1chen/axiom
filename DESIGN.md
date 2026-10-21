@@ -203,6 +203,24 @@ type still rechecks everything even though only changed
 modules need their C recompiled (the driver currently rebuilds
 all objects; it does not do make-style staleness).
 
+## The intent layer (v0.11)
+
+The language checks contracts; `tools/intent/` is the layer
+above it, mechanizing the design's core loop. An intent file
+(near-natural language plus a decision list plus properties)
+sits next to an AI-drafted Axiom program. `intentc.py` pins
+the spec (`SPEC.md`: every decision with its chosen answer;
+decisions still on their default are listed as accepted
+risks), runs the program's scenario checks and `axiomc
+verify`, and writes `EVIDENCE.md` with one tiered row per
+property (runtime-checked / bounded / UNCHECKED). The
+drafting step remains an AI's job; the tool pins, runs, tiers,
+and reports, and invents nothing. Worked example:
+`tools/intent/examples/` (coupon module: 8 properties, 7
+scenario + 1 bounded, 6 decisions on default). The earlier
+Python prototype of this loop lives in the design experiment
+notes; this is the version that targets real Axiom.
+
 ## Server runtime (v0.10)
 
 The `http` capability binds a pull-model HTTP server: the

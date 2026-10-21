@@ -1,0 +1,201 @@
+// Coupon module: the AI draft for coupon.intent.json.
+// Decisions pinned in SPEC.md; the constants below follow the
+// defaults until the human answers:
+//   stacking        = one_per_order   (status 4 on second coupon)
+//   expiry_boundary = end_of_day      (valid ON expires_day)
+//   per_user_limit  = from the coupon (demo uses 1)
+//   below_threshold = error_keep_coupon (status 1, use not recorded)
+//   percent_cap     = none by default (cap < 0 means no cap)
+//   refund          = full_refund_only (not modeled in apply; the
+//                     storefront layer owns refunds — see SPEC.md)
+//
+// Status codes: 0 ok, 1 below threshold, 2 expired,
+// 3 user limit reached, 4 order already has a coupon.
+
+struct Coupon {
+    code: string;
+    kind: int;         // 0 percent, 1 fixed cents
+    value: int;        // percent 0..100, or fixed cents
+    threshold: int;    // minimum subtotal in cents
+    expires_day: int;  // last valid day
+    per_user_limit: int;
+    invariant value >= 0;
+    invariant threshold >= 0;
+    invariant per_user_limit >= 0;
+}
+
+struct Discount {
+    percent_part: int;
+    fixed_part: int;
+    total: int;
+    invariant total == percent_part + fixed_part;
+    invariant percent_part >= 0 && fixed_part >= 0;
+}
+
+struct Use {
+    user: string;
+    code: string;
+    count: int;
+    invariant count >= 0;
+}
+
+struct CouponBook {
+    uses: [Use];
+}
+
+struct ApplyResult {
+    status: int;
+    discount: Discount;
+    invariant status >= 0 && status <= 4;
+}
+
+fn imin(a: int, b: int) -> int {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn empty_discount() -> Discount {
+    return Discount { percent_part: 0, fixed_part: 0, total: 0 };
+}
+
+fn rejected(status: int) -> ApplyResult {
+    return ApplyResult { status: status, discount: empty_discount() };
+}
+
+// The pure pricing core. cap < 0 means no cap.
+fn percent_discount(subtotal: int, pct: int, cap: int) -> int {
+    requires subtotal >= 0;
+    requires pct >= 0 && pct <= 100;
+    ensures result >= 0 && result <= subtotal;
+    let raw = subtotal * pct / 100;
+    if cap >= 0 && raw > cap {
+        return imin(cap, subtotal);
+    }
+    return raw;
+}
+
+fn uses_of(book: CouponBook, user: string, code: string) -> int {
+    for u in book.uses {
+        if u.user == user && u.code == code {
+            return u.count;
+        }
+    }
+    return 0;
+}
+
+fn record_use(book: CouponBook, user: string, code: string) {
+    let i = 0;
+    while i < len(book.uses) {
+        let u = book.uses[i];
+        if u.user == user && u.code == code {
+            u.count = u.count + 1;
+            return;
+        }
+        i = i + 1;
+    }
+    push(book.uses, Use { user: user, code: code, count: 1 });
+}
+
+// Apply coupon c to an order. order_has_coupon is the order's
+// stacking state (decision: one_per_order). Failed applications
+// never record a use (decision: error_keep_coupon, generalized
+// to every rejection).
+fn apply(book: CouponBook, order_has_coupon: bool, user: string,
+         c: Coupon, subtotal: int, day: int, cap: int) -> ApplyResult {
+    requires subtotal >= 0;
+    if order_has_coupon {
+        return rejected(4);
+    }
+    if day > c.expires_day {
+        return rejected(2);
+    }
+    if subtotal < c.threshold {
+        return rejected(1);
+    }
+    if uses_of(book, user, c.code) >= c.per_user_limit {
+        return rejected(3);
+    }
+    // Build the Discount in one literal: the invariant is
+    // checked after every field assignment, so mutating an
+    // existing Discount field by field would break
+    // total == percent_part + fixed_part mid-flight.
+    let pp = 0;
+    let fp = 0;
+    if c.kind == 0 {
+        pp = percent_discount(subtotal, c.value, cap);
+    } else {
+        fp = imin(c.value, subtotal);
+    }
+    let d = Discount {
+        percent_part: pp, fixed_part: fp, total: pp + fp
+    };
+    record_use(book, user, c.code);
+    return ApplyResult { status: 0, discount: d };
+}
+
+fn main() {
+    let book = CouponBook { uses: [] };
+    let pct20 = Coupon {
+        code: "P20", kind: 0, value: 20, threshold: 1000,
+        expires_day: 30, per_user_limit: 1
+    };
+    let fix500 = Coupon {
+        code: "F500", kind: 1, value: 500, threshold: 0,
+        expires_day: 30, per_user_limit: 1
+    };
+
+    // total_bounds: fixed coupon larger than the subtotal caps
+    // at the subtotal; percent stays within bounds.
+    let r1 = apply(book, false, "u1", fix500, 300, 1, -1);
+    check r1.status == 0 && r1.discount.total == 300;
+    print("PROP total_bounds OK");
+
+    // line_items: the parts, not just the total. A build that
+    // produced 15+5 instead of 20+0 must fail here.
+    let r2 = apply(book, false, "u2", pct20, 10000, 1, -1);
+    check r2.status == 0;
+    check r2.discount.percent_part == 2000 && r2.discount.fixed_part == 0;
+    check r2.discount.total == 2000;
+    let r3 = apply(book, false, "u3", fix500, 10000, 1, -1);
+    check r3.discount.fixed_part == 500 && r3.discount.percent_part == 0;
+    print("PROP line_items OK");
+
+    // threshold_error: below threshold -> status 1, and the
+    // coupon is NOT consumed.
+    let r4 = apply(book, false, "u4", pct20, 500, 1, -1);
+    check r4.status == 1;
+    check uses_of(book, "u4", "P20") == 0;
+    print("PROP threshold_error OK");
+
+    // stacking: an order that already took a coupon refuses
+    // the second.
+    let r5 = apply(book, true, "u5", fix500, 10000, 1, -1);
+    check r5.status == 4;
+    print("PROP stacking OK");
+
+    // expiry_boundary: valid on the day itself, dead the day
+    // after (end_of_day).
+    let r6 = apply(book, false, "u6", fix500, 10000, 30, -1);
+    check r6.status == 0;
+    let r7 = apply(book, false, "u7", fix500, 10000, 31, -1);
+    check r7.status == 2;
+    print("PROP expiry_boundary OK");
+
+    // user_limit: u2 already used P20 once (limit 1); a second
+    // use is refused, another user is unaffected.
+    let r8 = apply(book, false, "u2", pct20, 10000, 2, -1);
+    check r8.status == 3;
+    let r9 = apply(book, false, "u8", pct20, 10000, 2, -1);
+    check r9.status == 0;
+    print("PROP user_limit OK");
+
+    // percent_cap: uncapped 20% of 10000 is 2000; capped at
+    // 1500 it is 1500 exactly.
+    check percent_discount(10000, 20, -1) == 2000;
+    check percent_discount(10000, 20, 1500) == 1500;
+    print("PROP percent_cap OK");
+
+    print("coupon scenarios done");
+}

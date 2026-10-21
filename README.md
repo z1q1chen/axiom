@@ -13,13 +13,16 @@ program, and records every one of them in a **verification ledger**.
 
 ## Status
 
-v0.10, built 2026-10-21. A working language, not the full design
+v0.11, built 2026-10-21. A working language, not the full design
 proposal: the proof tier is on the roadmap in `DESIGN.md`, not in
 this build. Contracts are runtime-checked (bound for externs,
 bounded where `axiomc verify` has exhausted a domain), and the
 ledger and verify report say exactly that.
 
-v0.10 adds a server runtime: an `http` capability (pull-model:
+v0.11 adds the intent layer (`tools/intent/`): intent files
+with decision questions and defaulted answers, pinned into a
+spec and evidenced property by property against the ledger and
+verify tiers. v0.10 added a server runtime: an `http` capability (pull-model:
 listen / accept / read / respond) plus a small web framework
 written in Axiom itself, and the billing engine served as a
 JSON API under `examples/billing_api/` (run it, then
