@@ -17,6 +17,7 @@ pub enum TypeExpr {
     Str,
     Void,
     Array(Box<TypeExpr>),
+    Map(Box<TypeExpr>, Box<TypeExpr>),
     Named(String),
 }
 
@@ -108,6 +109,7 @@ pub enum Expr {
     Str(String, Span),
     Ident(String, Span),
     Array(Vec<Expr>, Span),
+    MapLit(Vec<(Expr, Expr)>, Span),
     StructLit(String, Vec<(String, Expr)>, Span),
     Call(Box<Expr>, Vec<Expr>, Span),
     Field(Box<Expr>, String, Span),
@@ -120,7 +122,8 @@ impl Expr {
     pub fn span(&self) -> &Span {
         match self {
             Expr::Int(_, s) | Expr::Float(_, s) | Expr::Bool(_, s) | Expr::Str(_, s)
-            | Expr::Ident(_, s) | Expr::Array(_, s) | Expr::StructLit(_, _, s)
+            | Expr::Ident(_, s) | Expr::Array(_, s) | Expr::MapLit(_, s)
+            | Expr::StructLit(_, _, s)
             | Expr::Call(_, _, s) | Expr::Field(_, _, s) | Expr::Index(_, _, s)
             | Expr::Bin(_, _, _, s) | Expr::Un(_, _, s) => s,
         }

@@ -136,6 +136,13 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RBracket, "']'")?;
             return Ok(TypeExpr::Array(Box::new(inner)));
         }
+        if self.eat(&Tok::LBrace) {
+            let key = self.parse_type()?;
+            self.expect(&Tok::Colon, "':'")?;
+            let val = self.parse_type()?;
+            self.expect(&Tok::RBrace, "'}'")?;
+            return Ok(TypeExpr::Map(Box::new(key), Box::new(val)));
+        }
         let (name, _) = self.ident()?;
         Ok(match name.as_str() {
             "int" => TypeExpr::Int,
@@ -563,6 +570,27 @@ impl<'a> Parser<'a> {
                 let end = self.expect(&Tok::RBracket, "']'")?.span;
                 let span = self.merge(&t.span, &end);
                 Ok(Expr::Array(elems, span))
+            }
+            Tok::LBrace => {
+                // Map literal: { k: v, ... }
+                let mut pairs = Vec::new();
+                if *self.peek() != Tok::RBrace {
+                    loop {
+                        let k = self.parse_expr()?;
+                        self.expect(&Tok::Colon, "':'")?;
+                        let v = self.parse_expr()?;
+                        pairs.push((k, v));
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                        if *self.peek() == Tok::RBrace {
+                            break;
+                        }
+                    }
+                }
+                let end = self.expect(&Tok::RBrace, "'}'")?.span;
+                let span = self.merge(&t.span, &end);
+                Ok(Expr::MapLit(pairs, span))
             }
             other => Err(format!(
                 "{}:{}: parse error: unexpected token {:?}",

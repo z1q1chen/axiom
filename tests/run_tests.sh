@@ -36,6 +36,8 @@ expect_out hello examples/hello.ax "total: 10"
 expect_out fib examples/fib.ax "10 55"
 expect_out transfer examples/transfer.ax "cash 70"
 expect_out ledger examples/ledger/main.ax "TRIAL BALANCE OK"
+expect_out wordcount examples/wordcount.ax "the appears 4 times"
+expect_out maptests tests/map_basics.ax "map ok"
 expect_violation requires tests/violate_requires.ax "amt > 0"
 expect_violation invariant tests/violate_invariant.ax "balance >= 0"
 

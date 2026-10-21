@@ -1,0 +1,19 @@
+// Map semantics, asserted in-language. Prints "map ok" iff all pass.
+fn main() {
+    let scores: {string: int} = { "a": 1 };
+    scores["b"] = 2;
+    check has(scores, "a");
+    check scores["b"] == 2;
+    del(scores, "a");
+    check has(scores, "a") == false;
+    check len(scores) == 1;
+    let by_id: {int: string} = {};
+    by_id[7] = "seven";
+    check by_id[7] == "seven";
+    let total = 0;
+    for k in scores {
+        total = total + scores[k];
+    }
+    check total == 2;
+    print("map ok");
+}

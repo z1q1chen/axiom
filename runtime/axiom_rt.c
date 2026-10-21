@@ -6,11 +6,12 @@
 #include <stdint.h>
 #include <stdarg.h>
 
-typedef enum { AX_INT, AX_FLOAT, AX_BOOL, AX_STR, AX_ARR, AX_OBJ, AX_VOID } AxTag;
+typedef enum { AX_INT, AX_FLOAT, AX_BOOL, AX_STR, AX_ARR, AX_OBJ, AX_MAP, AX_VOID } AxTag;
 
 typedef struct AxVal AxVal;
 typedef struct { int64_t len; int64_t cap; AxVal *data; } AxArrData;
 typedef struct { int32_t type_id; int32_t nfields; AxVal *fields; } AxObjData;
+typedef struct { int64_t len; int64_t cap; AxVal *keys; AxVal *vals; } AxMapData;
 
 struct AxVal {
     AxTag tag;
@@ -21,6 +22,7 @@ struct AxVal {
         char *s;
         AxArrData *arr;
         AxObjData *obj;
+        AxMapData *map;
     } u;
 };
 
@@ -94,6 +96,7 @@ static void ax_arr_set(AxVal arr, int64_t idx, AxVal v) {
 static int64_t ax_len(AxVal v) {
     if (v.tag == AX_ARR) return v.u.arr->len;
     if (v.tag == AX_STR) return (int64_t)strlen(v.u.s);
+    if (v.tag == AX_MAP) return v.u.map->len;
     ax_fail("type error: len of unsupported value");
     return 0;
 }
@@ -182,6 +185,7 @@ static AxVal ax_eq(AxVal a, AxVal b) {
         case AX_STR:   return ax_bool(strcmp(a.u.s, b.u.s) == 0);
         case AX_ARR:   return ax_bool(a.u.arr == b.u.arr);
         case AX_OBJ:   return ax_bool(a.u.obj == b.u.obj);
+        case AX_MAP:   return ax_bool(a.u.map == b.u.map);
         case AX_VOID:  return ax_bool(1);
     }
     return ax_bool(0);
@@ -202,6 +206,72 @@ static AxVal ax_le(AxVal a, AxVal b) {
 }
 static AxVal ax_gt(AxVal a, AxVal b) { return ax_lt(b, a); }
 static AxVal ax_ge(AxVal a, AxVal b) { return ax_le(b, a); }
+
+/* ---- maps (linear scan; v0.2 scale) ---- */
+static AxVal ax_map_new(void) {
+    AxVal r; AxMapData *m = ax_alloc(sizeof(AxMapData));
+    m->len = 0; m->cap = 8;
+    m->keys = ax_alloc(sizeof(AxVal) * 8);
+    m->vals = ax_alloc(sizeof(AxVal) * 8);
+    r.tag = AX_MAP; r.u.map = m; return r;
+}
+static int64_t ax_map_find(AxVal map, AxVal key) {
+    AxMapData *m = map.u.map;
+    for (int64_t i = 0; i < m->len; i++) {
+        if (ax_truth(ax_eq(m->keys[i], key))) return i;
+    }
+    return -1;
+}
+static AxVal ax_map_set(AxVal map, AxVal key, AxVal val) {
+    if (map.tag != AX_MAP) ax_fail("type error: index assignment on non-map");
+    if (key.tag != AX_INT && key.tag != AX_STR)
+        ax_fail("type error: map key must be int or string");
+    AxMapData *m = map.u.map;
+    int64_t at = ax_map_find(map, key);
+    if (at >= 0) { m->vals[at] = val; return map; }
+    if (m->len >= m->cap) {
+        m->cap *= 2;
+        AxVal *nk = ax_alloc(sizeof(AxVal) * (size_t)m->cap);
+        AxVal *nv = ax_alloc(sizeof(AxVal) * (size_t)m->cap);
+        memcpy(nk, m->keys, sizeof(AxVal) * (size_t)m->len);
+        memcpy(nv, m->vals, sizeof(AxVal) * (size_t)m->len);
+        m->keys = nk; m->vals = nv;
+    }
+    m->keys[m->len] = key;
+    m->vals[m->len] = val;
+    m->len++;
+    return map;
+}
+static AxVal ax_map_get(AxVal map, AxVal key) {
+    if (map.tag != AX_MAP) ax_fail("type error: index on non-map");
+    int64_t at = ax_map_find(map, key);
+    if (at < 0) ax_fail("map key not found");
+    return map.u.map->vals[at];
+}
+static int ax_map_has(AxVal map, AxVal key) {
+    if (map.tag != AX_MAP) ax_fail("type error: has() on non-map");
+    return ax_map_find(map, key) >= 0;
+}
+static AxVal ax_map_del(AxVal map, AxVal key) {
+    if (map.tag != AX_MAP) ax_fail("type error: del() on non-map");
+    AxMapData *m = map.u.map;
+    int64_t at = ax_map_find(map, key);
+    if (at >= 0) {
+        for (int64_t i = at; i + 1 < m->len; i++) {
+            m->keys[i] = m->keys[i + 1];
+            m->vals[i] = m->vals[i + 1];
+        }
+        m->len--;
+    }
+    return map;
+}
+static AxVal ax_map_keys(AxVal map) {
+    if (map.tag != AX_MAP) ax_fail("type error: keys() on non-map");
+    AxVal r = ax_arr_new();
+    AxMapData *m = map.u.map;
+    for (int64_t i = 0; i < m->len; i++) ax_arr_push(r, m->keys[i]);
+    return r;
+}
 
 /* ---- conversions and printing ---- */
 static char *ax_str_of(AxVal v) {
@@ -231,6 +301,25 @@ static char *ax_str_of(AxVal v) {
         case AX_OBJ: {
             snprintf(buf, sizeof buf, "struct#%d", (int)v.u.obj->type_id);
             return ax_strdup(buf);
+        }
+        case AX_MAP: {
+            size_t cap = 128, n = 0;
+            char *out = ax_alloc(cap);
+            out[n++] = '{';
+            AxMapData *m = v.u.map;
+            for (int64_t i = 0; i < m->len; i++) {
+                char *ks = ax_str_of(m->keys[i]);
+                char *vs = ax_str_of(m->vals[i]);
+                size_t need = strlen(ks) + strlen(vs) + 4;
+                while (n + need + 2 > cap) { cap *= 2; char *nd = ax_alloc(cap); memcpy(nd, out, n); out = nd; }
+                if (i) { out[n++] = ','; out[n++] = ' '; }
+                size_t kl = strlen(ks); memcpy(out + n, ks, kl); n += kl;
+                out[n++] = ':'; out[n++] = ' ';
+                size_t vl = strlen(vs); memcpy(out + n, vs, vl); n += vl;
+            }
+            if (n + 2 > cap) { cap += 8; char *nd = ax_alloc(cap); memcpy(nd, out, n); out = nd; }
+            out[n++] = '}'; out[n] = 0;
+            return out;
         }
     }
     return ax_strdup("?");
@@ -270,6 +359,35 @@ static AxVal ax_to_float(AxVal v) {
 static AxVal ax_range(int64_t a, int64_t b) {
     AxVal r = ax_arr_new();
     for (int64_t i = a; i < b; i++) ax_arr_push(r, ax_int(i));
+    return r;
+}
+static char *ax_dup_range(const char *s, size_t n) {
+    char *p = ax_alloc(n + 1);
+    memcpy(p, s, n);
+    p[n] = 0;
+    return p;
+}
+static AxVal ax_split(AxVal str, AxVal sep) {
+    if (str.tag != AX_STR || sep.tag != AX_STR)
+        ax_fail("type error: split() needs two strings");
+    if (sep.u.s[0] == 0) ax_fail("split() separator must not be empty");
+    AxVal r = ax_arr_new();
+    const char *s = str.u.s;
+    size_t sl = strlen(sep.u.s);
+    const char *cur = s;
+    for (;;) {
+        const char *hit = strstr(cur, sep.u.s);
+        AxVal part;
+        part.tag = AX_STR;
+        if (!hit) {
+            part.u.s = ax_dup_range(cur, strlen(cur));
+            ax_arr_push(r, part);
+            break;
+        }
+        part.u.s = ax_dup_range(cur, (size_t)(hit - cur));
+        ax_arr_push(r, part);
+        cur = hit + sl;
+    }
     return r;
 }
 static void ax_raise(AxVal msg) {

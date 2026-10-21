@@ -20,8 +20,13 @@ never freed) in v0.1; programs are batch jobs.
 ## Types
 
 `int` (i64), `float` (f64), `bool`, `string`, `void`, arrays `[T]`,
-and declared structs. No implicit numeric conversion; use the
-`int()` / `float()` builtins.
+maps `{K: V}` (K must be `int` or `string`), and declared structs.
+No implicit numeric conversion; use the `int()` / `float()` builtins.
+
+Map semantics: reading a missing key is a runtime error (use `has`
+to test first). Iteration order is insertion order; `for k in m`
+iterates keys. Maps, like arrays and structs, are shared by
+reference.
 
 ## Grammar sketch
 
@@ -96,7 +101,8 @@ for the roadmap and are never claimed by this compiler.
 `print(...)` (space-separated, newline at end), `len(x)`,
 `push(arr, v)` (mutates, returns the array), `range(n)` /
 `range(a, b)` (array of ints), `str(x)`, `int(x)`, `float(x)`,
-`raise(msg)` (stop with a message).
+`raise(msg)` (stop with a message), `has(m, k)`, `keys(m)`,
+`del(m, k)` (returns the map), `split(s, sep)` (array of strings).
 
 ## Equality
 
@@ -105,7 +111,7 @@ Arrays and structs compare by identity in v0.1.
 
 ## Roadmap (not in v0.1)
 
-- Maps, string interpolation, methods on structs, generics.
+- String interpolation, methods on structs, generics.
 - Capability declarations with binding to pre-verified
   implementations (the proposal's capability layer).
 - Contract tiers above runtime-checked: bounded model checking of

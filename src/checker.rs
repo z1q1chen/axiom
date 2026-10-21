@@ -10,6 +10,7 @@ pub enum Type {
     Str,
     Void,
     Array(Box<Type>),
+    Map(Box<Type>, Box<Type>),
     Struct(String),
 }
 
@@ -22,6 +23,7 @@ impl Type {
             Type::Str => "string".into(),
             Type::Void => "void".into(),
             Type::Array(t) => format!("[{}]", t.name()),
+            Type::Map(k, v) => format!("{{{}: {}}}", k.name(), v.name()),
             Type::Struct(n) => n.clone(),
         }
     }
@@ -41,6 +43,7 @@ pub enum TExprKind {
     Str(String),
     Ident(String),
     Array(Vec<TExpr>),
+    MapLit(Vec<(TExpr, TExpr)>),
     StructLit(usize, String, Vec<(usize, TExpr)>),
     Call(String, Vec<TExpr>),
     Builtin(String, Vec<TExpr>),
@@ -55,7 +58,7 @@ pub enum TStmt {
     Let(String, TExpr),
     Assign(String, TExpr),
     FieldAssign(TExpr, usize, Option<String>, TExpr),
-    IndexAssign(TExpr, TExpr, TExpr),
+    IndexAssign(TExpr, TExpr, TExpr, bool), // bool: target is a map
     If(TExpr, Vec<TStmt>, Option<Vec<TStmt>>),
     While(TExpr, Vec<TStmt>),
     For(String, TExpr, Vec<TStmt>),
@@ -116,7 +119,10 @@ pub struct TProgram {
     pub globals: Vec<TGlobal>,
 }
 
-const BUILTINS: &[&str] = &["print", "len", "push", "range", "str", "int", "float", "raise"];
+const BUILTINS: &[&str] = &[
+    "print", "len", "push", "range", "str", "int", "float", "raise", "has", "keys", "del",
+    "split",
+];
 
 struct FnSig {
     params: Vec<(String, Type)>,
@@ -162,6 +168,18 @@ impl Checker {
             TypeExpr::Str => Type::Str,
             TypeExpr::Void => Type::Void,
             TypeExpr::Array(inner) => Type::Array(Box::new(self.resolve(inner, span)?)),
+            TypeExpr::Map(k, v) => {
+                let kt = self.resolve(k, span)?;
+                if kt != Type::Int && kt != Type::Str {
+                    return Err(format!(
+                        "{}:{}: map key type must be int or string, got {}",
+                        span.file,
+                        span.line,
+                        kt.name()
+                    ));
+                }
+                Type::Map(Box::new(kt), Box::new(self.resolve(v, span)?))
+            }
             TypeExpr::Named(name) => {
                 if self.struct_fields.contains_key(name) || self.struct_ids.contains_key(name) {
                     Type::Struct(name.clone())
@@ -500,31 +518,53 @@ impl Checker {
             }
             Stmt::IndexAssign(arr, idx, value, span) => {
                 let tarr = self.check_expr(arr, None)?;
-                let elem = match &tarr.ty {
-                    Type::Array(t) => (**t).clone(),
-                    other => {
-                        return self.err(
-                            span,
-                            &format!("index assignment on non-array type {}", other.name()),
-                        )
+                match &tarr.ty {
+                    Type::Map(k, v) => {
+                        let (k, v) = ((**k).clone(), (**v).clone());
+                        let tidx = self.check_expr(idx, Some(&k))?;
+                        if tidx.ty != k {
+                            return self.err(
+                                span,
+                                &format!("map key has type {}, expected {}", tidx.ty.name(), k.name()),
+                            );
+                        }
+                        let tv = self.check_expr(value, Some(&v))?;
+                        if tv.ty != v {
+                            return self.err(
+                                span,
+                                &format!(
+                                    "cannot assign {} to map value of type {}",
+                                    tv.ty.name(),
+                                    v.name()
+                                ),
+                            );
+                        }
+                        Ok(TStmt::IndexAssign(tarr, tidx, tv, true))
                     }
-                };
-                let tidx = self.check_expr(idx, Some(&Type::Int))?;
-                if tidx.ty != Type::Int {
-                    return self.err(span, "array index must be int");
-                }
-                let v = self.check_expr(value, Some(&elem))?;
-                if v.ty != elem {
-                    return self.err(
+                    Type::Array(t) => {
+                        let elem = (**t).clone();
+                        let tidx = self.check_expr(idx, Some(&Type::Int))?;
+                        if tidx.ty != Type::Int {
+                            return self.err(span, "array index must be int");
+                        }
+                        let v = self.check_expr(value, Some(&elem))?;
+                        if v.ty != elem {
+                            return self.err(
+                                span,
+                                &format!(
+                                    "cannot assign {} to array element of type {}",
+                                    v.ty.name(),
+                                    elem.name()
+                                ),
+                            );
+                        }
+                        Ok(TStmt::IndexAssign(tarr, tidx, v, false))
+                    }
+                    other => self.err(
                         span,
-                        &format!(
-                            "cannot assign {} to array element of type {}",
-                            v.ty.name(),
-                            elem.name()
-                        ),
-                    );
+                        &format!("index assignment on non-indexable type {}", other.name()),
+                    ),
                 }
-                Ok(TStmt::IndexAssign(tarr, tidx, v))
             }
             Stmt::If(cond, then, els, span) => {
                 let c = self.check_expr(cond, Some(&Type::Bool))?;
@@ -552,10 +592,11 @@ impl Checker {
                 let it = self.check_expr(iter, None)?;
                 let elem = match &it.ty {
                     Type::Array(t) => (**t).clone(),
+                    Type::Map(k, _) => (**k).clone(),
                     other => {
                         return self.err(
                             span,
-                            &format!("for loop over non-array type {}", other.name()),
+                            &format!("for loop over non-iterable type {}", other.name()),
                         )
                     }
                 };
@@ -803,20 +844,95 @@ impl Checker {
             }
             Expr::Index(arr, idx, span) => {
                 let tarr = self.check_expr(arr, None)?;
-                let elem = match &tarr.ty {
-                    Type::Array(t) => (**t).clone(),
-                    other => {
+                match &tarr.ty {
+                    Type::Map(k, v) => {
+                        let (k, v) = ((**k).clone(), (**v).clone());
+                        let tidx = self.check_expr(idx, Some(&k))?;
+                        if tidx.ty != k {
+                            return self.err(
+                                span,
+                                &format!(
+                                    "map key has type {}, expected {}",
+                                    tidx.ty.name(),
+                                    k.name()
+                                ),
+                            );
+                        }
+                        Ok(te(TExprKind::Index(Box::new(tarr), Box::new(tidx)), v))
+                    }
+                    Type::Array(t) => {
+                        let elem = (**t).clone();
+                        let tidx = self.check_expr(idx, Some(&Type::Int))?;
+                        if tidx.ty != Type::Int {
+                            return self.err(span, "array index must be int");
+                        }
+                        Ok(te(TExprKind::Index(Box::new(tarr), Box::new(tidx)), elem))
+                    }
+                    other => self.err(
+                        span,
+                        &format!("indexing a non-indexable type {}", other.name()),
+                    ),
+                }
+            }
+            Expr::MapLit(pairs, span) => {
+                let expected_kv = match expected {
+                    Some(Type::Map(k, v)) => Some(((**k).clone(), (**v).clone())),
+                    _ => None,
+                };
+                if pairs.is_empty() {
+                    return match expected_kv {
+                        Some((k, v)) => Ok(te(
+                            TExprKind::MapLit(vec![]),
+                            Type::Map(Box::new(k), Box::new(v)),
+                        )),
+                        None => self.err(
+                            span,
+                            "cannot infer the key/value types of an empty map; add a type annotation",
+                        ),
+                    };
+                }
+                let (exp_k, exp_v) = match &expected_kv {
+                    Some((k, v)) => (Some(k.clone()), Some(v.clone())),
+                    None => (None, None),
+                };
+                let first_k = self.check_expr(&pairs[0].0, exp_k.as_ref())?;
+                let first_v = self.check_expr(&pairs[0].1, exp_v.as_ref())?;
+                let (kt, vt) = (first_k.ty.clone(), first_v.ty.clone());
+                if kt != Type::Int && kt != Type::Str {
+                    return self.err(
+                        span,
+                        &format!("map key type must be int or string, got {}", kt.name()),
+                    );
+                }
+                if vt == Type::Void {
+                    return self.err(span, "map values cannot be void");
+                }
+                let mut out = vec![(first_k, first_v)];
+                for (ke, ve) in &pairs[1..] {
+                    let tk = self.check_expr(ke, Some(&kt))?;
+                    if tk.ty != kt {
                         return self.err(
                             span,
-                            &format!("indexing a non-array type {}", other.name()),
-                        )
+                            &format!("map key has type {}, expected {}", tk.ty.name(), kt.name()),
+                        );
                     }
-                };
-                let tidx = self.check_expr(idx, Some(&Type::Int))?;
-                if tidx.ty != Type::Int {
-                    return self.err(span, "array index must be int");
+                    let tv = self.check_expr(ve, Some(&vt))?;
+                    if tv.ty != vt {
+                        return self.err(
+                            span,
+                            &format!(
+                                "map value has type {}, expected {}",
+                                tv.ty.name(),
+                                vt.name()
+                            ),
+                        );
+                    }
+                    out.push((tk, tv));
                 }
-                Ok(te(TExprKind::Index(Box::new(tarr), Box::new(tidx)), elem))
+                Ok(te(
+                    TExprKind::MapLit(out),
+                    Type::Map(Box::new(kt), Box::new(vt)),
+                ))
             }
             Expr::Bin(op, l, r, span) => {
                 let tl = self.check_expr(l, None)?;
@@ -879,12 +995,15 @@ impl Checker {
                 }
                 let a = self.check_expr(&args[0], None)?;
                 match a.ty {
-                    Type::Str | Type::Array(_) => {
+                    Type::Str | Type::Array(_) | Type::Map(_, _) => {
                         Ok(te(TExprKind::Builtin(name.into(), vec![a]), Type::Int))
                     }
                     ref other => self.err(
                         span,
-                        &format!("len() needs a string or an array, got {}", other.name()),
+                        &format!(
+                            "len() needs a string, an array, or a map, got {}",
+                            other.name()
+                        ),
                     ),
                 }
             }
@@ -969,6 +1088,79 @@ impl Checker {
                         &format!("float() cannot convert {}", other.name()),
                     ),
                 }
+            }
+            "has" => {
+                if args.len() != 2 {
+                    return Err(arity("2", args.len()));
+                }
+                let m = self.check_expr(&args[0], None)?;
+                let k = match &m.ty {
+                    Type::Map(k, _) => (**k).clone(),
+                    other => {
+                        return self.err(
+                            span,
+                            &format!("has() needs a map, got {}", other.name()),
+                        )
+                    }
+                };
+                let key = self.check_expr(&args[1], Some(&k))?;
+                if key.ty != k {
+                    return self.err(span, "has() key has the wrong type");
+                }
+                Ok(te(TExprKind::Builtin(name.into(), vec![m, key]), Type::Bool))
+            }
+            "keys" => {
+                if args.len() != 1 {
+                    return Err(arity("1", args.len()));
+                }
+                let m = self.check_expr(&args[0], None)?;
+                match &m.ty {
+                    Type::Map(k, _) => {
+                        let kt = (**k).clone();
+                        Ok(te(
+                            TExprKind::Builtin(name.into(), vec![m]),
+                            Type::Array(Box::new(kt)),
+                        ))
+                    }
+                    other => self.err(
+                        span,
+                        &format!("keys() needs a map, got {}", other.name()),
+                    ),
+                }
+            }
+            "del" => {
+                if args.len() != 2 {
+                    return Err(arity("2", args.len()));
+                }
+                let m = self.check_expr(&args[0], None)?;
+                let (k, ty) = match &m.ty {
+                    Type::Map(k, _) => ((**k).clone(), m.ty.clone()),
+                    other => {
+                        return self.err(
+                            span,
+                            &format!("del() needs a map, got {}", other.name()),
+                        )
+                    }
+                };
+                let key = self.check_expr(&args[1], Some(&k))?;
+                if key.ty != k {
+                    return self.err(span, "del() key has the wrong type");
+                }
+                Ok(te(TExprKind::Builtin(name.into(), vec![m, key]), ty))
+            }
+            "split" => {
+                if args.len() != 2 {
+                    return Err(arity("2", args.len()));
+                }
+                let s = self.check_expr(&args[0], Some(&Type::Str))?;
+                let sep = self.check_expr(&args[1], Some(&Type::Str))?;
+                if s.ty != Type::Str || sep.ty != Type::Str {
+                    return self.err(span, "split() needs two strings");
+                }
+                Ok(te(
+                    TExprKind::Builtin(name.into(), vec![s, sep]),
+                    Type::Array(Box::new(Type::Str)),
+                ))
             }
             "raise" => {
                 if args.len() != 1 {

@@ -13,10 +13,14 @@ program, and records every one of them in a **verification ledger**.
 
 ## Status
 
-v0.1, built 2026-10-21. A working language, not the full design
+v0.2, built 2026-10-21. A working language, not the full design
 proposal: formal proof tiers and capability binding are on the
-roadmap in `DESIGN.md`, not in this build. Contracts in v0.1 are
+roadmap in `DESIGN.md`, not in this build. Contracts are
 runtime-checked, and the ledger says exactly that.
+
+v0.2 adds maps (`{string: int}` style, int or string keys) with
+`has` / `keys` / `del`, plus a `split` builtin. See
+`examples/wordcount.ax`.
 
 ## Quick start
 
@@ -54,10 +58,11 @@ fn main() {
 }
 ```
 
-Features: `int / float / bool / string`, arrays, structs, functions
-(recursion included), `if / while / for-in`, modules via `use`,
-string concatenation, builtins `print, len, push, range, str, int,
-float`, and a `check expr;` statement for inline assertions.
+Features: `int / float / bool / string`, arrays, maps, structs,
+functions (recursion included), `if / while / for-in`, modules via
+`use`, string concatenation, builtins `print, len, push, range, str,
+int, float, has, keys, del, split`, and a `check expr;` statement
+for inline assertions.
 
 See `DESIGN.md` for the spec, the contract semantics, and the
 roadmap. Examples live in `examples/`; the substantial one is

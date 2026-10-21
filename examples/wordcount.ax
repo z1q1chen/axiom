@@ -1,0 +1,18 @@
+// Word frequency counter: maps and split() at work.
+fn main() {
+    let text = "the quick brown fox jumps over the lazy dog the fox runs and the dog sleeps";
+    let counts: {string: int} = {};
+    let words = split(text, " ");
+    for w in words {
+        if has(counts, w) {
+            counts[w] = counts[w] + 1;
+        } else {
+            counts[w] = 1;
+        }
+    }
+    print("distinct words:", len(counts));
+    for k in keys(counts) {
+        print(k, counts[k]);
+    }
+    print("the appears", counts["the"], "times");
+}

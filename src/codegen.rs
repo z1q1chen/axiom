@@ -241,15 +241,22 @@ impl<'a> CodeGen<'a> {
                 out.push_str(" }\n");
                 out
             }
-            TStmt::IndexAssign(arr, idx, value) => {
+            TStmt::IndexAssign(arr, idx, value, is_map) => {
                 let a = self.gen_expr(arr, Ctx::Normal);
                 let i = self.gen_expr(idx, Ctx::Normal);
                 let v = self.gen_expr(value, Ctx::Normal);
                 let n = self.fresh();
-                format!(
-                    "{}{{ AxVal __t{} = {}; ax_arr_set(__t{}, ({}).u.i, {}); }}\n",
-                    pad, n, a, n, i, v
-                )
+                if *is_map {
+                    format!(
+                        "{}{{ AxVal __t{} = {}; ax_map_set(__t{}, {}, {}); }}\n",
+                        pad, n, a, n, i, v
+                    )
+                } else {
+                    format!(
+                        "{}{{ AxVal __t{} = {}; ax_arr_set(__t{}, ({}).u.i, {}); }}\n",
+                        pad, n, a, n, i, v
+                    )
+                }
             }
             TStmt::If(cond, then, els) => {
                 let c = self.gen_expr(cond, Ctx::Normal);
@@ -272,7 +279,12 @@ impl<'a> CodeGen<'a> {
                 out
             }
             TStmt::For(var, iter, body) => {
-                let it = self.gen_expr(iter, Ctx::Normal);
+                let raw = self.gen_expr(iter, Ctx::Normal);
+                let it = if matches!(iter.ty, Type::Map(_, _)) {
+                    format!("ax_map_keys({})", raw)
+                } else {
+                    raw
+                };
                 let n = self.fresh();
                 let mut out = format!(
                     "{}{{ AxVal __arr{n} = {it}; int64_t __n{n} = ax_len(__arr{n}); for (int64_t __i{n} = 0; __i{n} < __n{n}; __i{n}++) {{\n",
@@ -390,6 +402,10 @@ impl<'a> CodeGen<'a> {
                     "str" => format!("ax_str(ax_str_of({}))", parts[0]),
                     "int" => format!("ax_to_int({})", parts[0]),
                     "float" => format!("ax_to_float({})", parts[0]),
+                    "has" => format!("ax_bool(ax_map_has({}, {}))", parts[0], parts[1]),
+                    "keys" => format!("ax_map_keys({})", parts[0]),
+                    "del" => format!("ax_map_del({}, {})", parts[0], parts[1]),
+                    "split" => format!("ax_split({}, {})", parts[0], parts[1]),
                     "raise" => format!("({{ ax_raise({}); ax_void(); }})", parts[0]),
                     _ => "ax_void()".to_string(),
                 }
@@ -401,7 +417,23 @@ impl<'a> CodeGen<'a> {
             TExprKind::Index(arr, idx) => {
                 let a = self.gen_expr(arr, ctx);
                 let i = self.gen_expr(idx, ctx);
-                format!("ax_arr_get({}, ({}).u.i)", a, i)
+                if matches!(arr.ty, Type::Map(_, _)) {
+                    format!("ax_map_get({}, {})", a, i)
+                } else {
+                    format!("ax_arr_get({}, ({}).u.i)", a, i)
+                }
+            }
+            TExprKind::MapLit(pairs) => {
+                let n = self.fresh();
+                let mut out = format!("({{ AxVal __t{} = ax_map_new();", n);
+                for (ke, ve) in pairs {
+                    let k = self.gen_expr(ke, ctx);
+                    let v = self.gen_expr(ve, ctx);
+                    out.push_str(&format!(" ax_map_set(__t{}, {}, {});", n, k, v));
+                }
+                out.push_str(&format!(" __t{}; ", n));
+                out.push_str("})");
+                out
             }
             TExprKind::Bin(op, l, r) => {
                 let lv = self.gen_expr(l, ctx);
