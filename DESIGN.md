@@ -203,6 +203,27 @@ type still rechecks everything even though only changed
 modules need their C recompiled (the driver currently rebuilds
 all objects; it does not do make-style staleness).
 
+## Server runtime (v0.10)
+
+The `http` capability binds a pull-model HTTP server: the
+program calls `http_listen(port)`, blocks in `http_accept` for
+one request at a time, reads it through `http_req_method /
+path / query / header / body`, and answers once with
+`http_respond` (connection close, one request per connection,
+single-threaded and sequential). Internal buffers are plain
+malloc; only the copies handed to Axiom are runtime values.
+Limits: 64 KB headers, 1 MB body, 128 request slots. Paths are
+not percent-decoded natively; the framework decodes query
+values. `examples/billing_api/` is the proof: a framework
+(`web.ax` — Request/Response, query parsing, URL decoding,
+flat-JSON field extraction) written in Axiom, and the billing
+engine served as a JSON API. Because engine contract failures
+stop the process, the API validates ids, states, and amounts
+at the boundary; one engine precondition (the sweep may only
+void credit-settled invoices) becomes an explicit 409 guard on
+time travel. Two small builtins arrived with it: `chr` and
+`ord` (byte-level, for parsers).
+
 ## Garbage collection (v0.9)
 
 `axiomc build/run --gc` enables a mark-sweep collector

@@ -1,0 +1,494 @@
+// Billing API: the billing engine (examples/billing) served
+// over HTTP by the web.ax framework.
+//
+//   POST /customers            {name, email}            -> 201 customer
+//   GET  /customers                                     -> [customer]
+//   POST /plans                {name, price_cents, period_days,
+//                               trial_days, usage_cents} -> 201 plan
+//   GET  /plans                                         -> [plan]
+//   POST /subscriptions        {customer_id, plan_id}   -> 201 subscription
+//   GET  /subscriptions/{id}                            -> subscription
+//   POST /subscriptions/{id}/usage       {units}        -> subscription
+//   POST /subscriptions/{id}/change-plan {plan_id}      -> subscription
+//   POST /subscriptions/{id}/cancel      {}             -> subscription
+//   GET  /invoices?customer_id=N                        -> [invoice]
+//   GET  /invoices/{id}                                 -> invoice
+//   POST /invoices/{id}/pay    {amount, method, success} -> {paid, payment, invoice}
+//   POST /payments/{id}/refund {amount}                 -> 201 refund
+//   POST /days                 {day}                    -> {day}
+//   GET  /trial-balance                                 -> {accounts, balanced}
+//   GET  /health                                        -> {ok}
+//
+// Mutations accept an optional "day"; the server tracks the
+// current day and runs the engine's daily sweep once per day,
+// in order, up to that day before acting. The engine raises on
+// missing ids and its checks exit the process, so every route
+// validates ids, states, and amounts BEFORE calling in — the
+// same guards the engine documents, applied at the boundary.
+
+use "../billing/types.ax";
+use "../billing/ledger.ax";
+use "../billing/billing.ax";
+use "../billing/reports.ax";
+use "web.ax";
+
+struct Api {
+    store: Store;
+    day: int;
+}
+
+// --- existence guards (the engine's find_* raise) ---
+
+fn has_customer(s: Store, id: int) -> bool {
+    for c in s.customers {
+        if c.id == id {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_plan(s: Store, id: int) -> bool {
+    for p in s.plans {
+        if p.id == id {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_sub(s: Store, id: int) -> bool {
+    for sub in s.subs {
+        if sub.id == id {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_invoice(s: Store, id: int) -> bool {
+    for inv in s.invoices {
+        if inv.id == id {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_payment(s: Store, id: int) -> bool {
+    for p in s.payments {
+        if p.id == id {
+            return true;
+        }
+    }
+    return false;
+}
+
+// --- JSON encoders ---
+
+fn customer_json(c: Customer) -> string {
+    let l = chr(123);
+    let r = chr(125);
+    let name = json_escape(c.name);
+    let email = json_escape(c.email);
+    return "{l}\"id\": {c.id}, \"name\": \"{name}\", \"email\": \"{email}\", \"credit_cents\": {c.credit_cents}{r}";
+}
+
+fn plan_json(p: Plan) -> string {
+    let l = chr(123);
+    let r = chr(125);
+    let name = json_escape(p.name);
+    return "{l}\"id\": {p.id}, \"name\": \"{name}\", \"price_cents\": {p.price_cents}, \"period_days\": {p.period_days}, \"trial_days\": {p.trial_days}, \"usage_cents\": {p.usage_cents}{r}";
+}
+
+fn sub_json(sub: Subscription) -> string {
+    let l = chr(123);
+    let r = chr(125);
+    let state = sub_state_name(sub.state);
+    return "{l}\"id\": {sub.id}, \"customer_id\": {sub.customer_id}, \"plan_id\": {sub.plan_id}, \"state\": {sub.state}, \"state_name\": \"{state}\", \"period_start\": {sub.period_start}, \"period_end\": {sub.period_end}, \"deferred_cents\": {sub.deferred_cents}, \"pending_usage\": {sub.pending_usage}, \"last_invoice_id\": {sub.last_invoice_id}{r}";
+}
+
+fn line_json(ln: InvoiceLine) -> string {
+    let l = chr(123);
+    let r = chr(125);
+    let desc = json_escape(ln.description);
+    return "{l}\"description\": \"{desc}\", \"quantity\": {ln.quantity}, \"unit_cents\": {ln.unit_cents}, \"amount\": {ln.amount}{r}";
+}
+
+fn invoice_json(inv: Invoice) -> string {
+    let l = chr(123);
+    let r = chr(125);
+    let state = inv_state_name(inv.state);
+    let lines = "";
+    let first = true;
+    for ln in inv.lines {
+        if !first {
+            lines = lines + ", ";
+        }
+        first = false;
+        lines = lines + line_json(ln);
+    }
+    return "{l}\"id\": {inv.id}, \"customer_id\": {inv.customer_id}, \"sub_id\": {inv.sub_id}, \"state\": {inv.state}, \"state_name\": \"{state}\", \"issued_day\": {inv.issued_day}, \"due_day\": {inv.due_day}, \"lines\": [{lines}], \"subtotal\": {inv.subtotal}, \"plan_cents\": {inv.plan_cents}, \"usage_cents\": {inv.usage_cents}, \"tax\": {inv.tax}, \"total\": {inv.total}, \"credit_applied\": {inv.credit_applied}, \"amount_paid\": {inv.amount_paid}{r}";
+}
+
+fn payment_json(p: Payment) -> string {
+    let l = chr(123);
+    let r = chr(125);
+    let state = pay_state_name(p.state);
+    let method = json_escape(p.method);
+    return "{l}\"id\": {p.id}, \"invoice_id\": {p.invoice_id}, \"customer_id\": {p.customer_id}, \"amount\": {p.amount}, \"method\": \"{method}\", \"state\": {p.state}, \"state_name\": \"{state}\", \"day\": {p.day}{r}";
+}
+
+fn refund_json(rf: Refund) -> string {
+    let l = chr(123);
+    let r = chr(125);
+    return "{l}\"id\": {rf.id}, \"payment_id\": {rf.payment_id}, \"invoice_id\": {rf.invoice_id}, \"amount\": {rf.amount}, \"day\": {rf.day}{r}";
+}
+
+// --- day handling ---
+
+// The day a mutation happens on: its body's "day" when given,
+// else the server's current day. Advances the sweep first.
+fn mutation_day(api: Api, req: Request) -> int {
+    let d = api.day;
+    if json_has(req.body, "day") {
+        d = json_int(req.body, "day");
+    }
+    if d > api.day {
+        let cur = api.day;
+        while cur < d {
+            cur = cur + 1;
+            process_day(api.store, cur);
+        }
+        api.day = d;
+    }
+    return api.day;
+}
+
+// --- routes ---
+
+fn route_customers(api: Api, req: Request) -> Response {
+    let s = api.store;
+    if req.method == "POST" && len(req.parts) == 2 {
+        let name = json_str(req.body, "name");
+        let email = json_str(req.body, "email");
+        if len(name) == 0 {
+            return bad_request("name is required");
+        }
+        let c = add_customer(s, name, email);
+        return created(customer_json(c));
+    }
+    if req.method == "GET" && len(req.parts) == 2 {
+        let items = "";
+        let first = true;
+        for c in s.customers {
+            if !first {
+                items = items + ", ";
+            }
+            first = false;
+            items = items + customer_json(c);
+        }
+        return ok(json_wrap("customers", "[{items}]"));
+    }
+    return not_found();
+}
+
+fn route_plans(api: Api, req: Request) -> Response {
+    let s = api.store;
+    if req.method == "POST" && len(req.parts) == 2 {
+        let name = json_str(req.body, "name");
+        if len(name) == 0 {
+            return bad_request("name is required");
+        }
+        let period = json_int(req.body, "period_days");
+        if period <= 0 {
+            return bad_request("period_days must be positive");
+        }
+        let p = add_plan(s, name, json_int(req.body, "price_cents"),
+                         period, json_int(req.body, "trial_days"),
+                         json_int(req.body, "usage_cents"));
+        return created(plan_json(p));
+    }
+    if req.method == "GET" && len(req.parts) == 2 {
+        let items = "";
+        let first = true;
+        for p in s.plans {
+            if !first {
+                items = items + ", ";
+            }
+            first = false;
+            items = items + plan_json(p);
+        }
+        return ok(json_wrap("plans", "[{items}]"));
+    }
+    return not_found();
+}
+
+fn route_subscriptions(api: Api, req: Request) -> Response {
+    let s = api.store;
+    if req.method == "POST" && len(req.parts) == 2 {
+        let cid = json_int(req.body, "customer_id");
+        let pid = json_int(req.body, "plan_id");
+        if !has_customer(s, cid) {
+            return bad_request("unknown customer_id");
+        }
+        if !has_plan(s, pid) {
+            return bad_request("unknown plan_id");
+        }
+        let day = mutation_day(api, req);
+        let sub = subscribe(s, cid, pid, day);
+        return created(sub_json(sub));
+    }
+    if len(req.parts) >= 3 {
+        let id = int(seg(req, 2));
+        if !has_sub(s, id) {
+            return not_found();
+        }
+        let sub = find_sub(s, id);
+        if req.method == "GET" && len(req.parts) == 3 {
+            return ok(sub_json(sub));
+        }
+        if req.method == "POST" && len(req.parts) == 4 {
+            let action = seg(req, 3);
+            if action == "usage" {
+                let units = json_int(req.body, "units");
+                if units <= 0 {
+                    return bad_request("units must be positive");
+                }
+                if sub.state == 3 {
+                    return conflict("subscription is cancelled");
+                }
+                record_usage(s, id, units);
+                return ok(sub_json(find_sub(s, id)));
+            }
+            if action == "change-plan" {
+                let pid = json_int(req.body, "plan_id");
+                if !has_plan(s, pid) {
+                    return bad_request("unknown plan_id");
+                }
+                if sub.state != 1 && sub.state != 2 {
+                    return conflict("subscription is not active");
+                }
+                let day = mutation_day(api, req);
+                if day < sub.period_start || day >= sub.period_end {
+                    return bad_request("day is outside the current period");
+                }
+                let updated = change_plan(s, id, pid, day);
+                return ok(sub_json(updated));
+            }
+            if action == "cancel" {
+                if sub.state == 3 {
+                    return conflict("subscription is already cancelled");
+                }
+                cancel_subscription(s, id);
+                return ok(sub_json(find_sub(s, id)));
+            }
+        }
+    }
+    return not_found();
+}
+
+fn route_invoices(api: Api, req: Request) -> Response {
+    let s = api.store;
+    if req.method == "GET" && len(req.parts) == 2 {
+        let filter = -1;
+        if has(req.query, "customer_id") {
+            filter = int(req.query["customer_id"]);
+        }
+        let items = "";
+        let first = true;
+        for inv in s.invoices {
+            if filter < 0 || inv.customer_id == filter {
+                if !first {
+                    items = items + ", ";
+                }
+                first = false;
+                items = items + invoice_json(inv);
+            }
+        }
+        return ok(json_wrap("invoices", "[{items}]"));
+    }
+    if len(req.parts) >= 3 {
+        let id = int(seg(req, 2));
+        if !has_invoice(s, id) {
+            return not_found();
+        }
+        let inv = find_invoice(s, id);
+        if req.method == "GET" && len(req.parts) == 3 {
+            return ok(invoice_json(inv));
+        }
+        if req.method == "POST" && len(req.parts) == 4
+                && seg(req, 3) == "pay" {
+            let amount = json_int(req.body, "amount");
+            if amount <= 0 {
+                return bad_request("amount must be positive");
+            }
+            if inv.state != 0 && inv.state != 3 {
+                return conflict("invoice is not open");
+            }
+            let method = json_str(req.body, "method");
+            let m = "card";
+            if len(method) > 0 {
+                m = method;
+            }
+            let success = true;
+            if json_has(req.body, "success") {
+                success = json_bool(req.body, "success");
+            }
+            let day = mutation_day(api, req);
+            let paid = record_payment(s, id, amount, m, day, success);
+            // The payment just recorded is the last one stored.
+            let pay = s.payments[len(s.payments) - 1];
+            let now = find_invoice(s, id);
+            let ps = payment_json(pay);
+            let is = invoice_json(now);
+            let l = chr(123);
+            let r = chr(125);
+            return ok("{l}\"paid\": {paid}, \"payment\": {ps}, \"invoice\": {is}{r}");
+        }
+    }
+    return not_found();
+}
+
+fn route_payments(api: Api, req: Request) -> Response {
+    let s = api.store;
+    if req.method == "POST" && len(req.parts) == 4
+            && seg(req, 3) == "refund" {
+        let id = int(seg(req, 2));
+        if !has_payment(s, id) {
+            return not_found();
+        }
+        let pay = find_payment(s, id);
+        let amount = json_int(req.body, "amount");
+        if amount <= 0 {
+            return bad_request("amount must be positive");
+        }
+        if pay.state != 0 {
+            return conflict("payment is not in a refundable state");
+        }
+        if amount > pay.amount {
+            return bad_request("amount exceeds the payment");
+        }
+        // Replicate the engine's credit check before calling.
+        let inv = find_invoice(s, pay.invoice_id);
+        let cust = find_customer(s, inv.customer_id);
+        let to_invoice = imin(amount, inv.amount_paid - inv.credit_applied);
+        let to_credit = amount - to_invoice;
+        if cust.credit_cents < to_credit {
+            return conflict("refund would claw back more credit than the customer has");
+        }
+        let day = mutation_day(api, req);
+        let r = refund_payment(s, id, amount, day);
+        return created(refund_json(r));
+    }
+    return not_found();
+}
+
+// Advancing time past an invoice's grace window makes the
+// sweep void it, and the engine only voids invoices settled
+// purely by credit (cash settlements must be refunded first —
+// its check would stop the process). Returns the blocking
+// invoice id, or 0 when the advance is safe.
+fn sweep_blocker(s: Store, target_day: int) -> int {
+    for inv in s.invoices {
+        if (inv.state == 0 || inv.state == 3)
+                && inv.amount_paid > inv.credit_applied
+                && target_day > inv.due_day + s.grace_days {
+            return inv.id;
+        }
+    }
+    return 0;
+}
+
+fn route(api: Api, req: Request) -> Response {
+    let s = api.store;
+    // One guard for every route that can advance time: refuse
+    // before the sweep can reach an unvoidable invoice.
+    if json_has(req.body, "day") {
+        let target = json_int(req.body, "day");
+        if target > api.day {
+            let blocker = sweep_blocker(s, target);
+            if blocker > 0 {
+                return conflict("invoice {blocker} has cash payments and cannot be voided by the sweep; refund it before advancing past its grace window");
+            }
+        }
+    }
+    let top = seg(req, 1);
+    if top == "health" && req.method == "GET" {
+        return ok(json_wrap("ok", "true"));
+    }
+    if top == "trial-balance" && req.method == "GET" {
+        let l = chr(123);
+        let r = chr(125);
+        let items = "";
+        let first = true;
+        for a in s.accounts {
+            if !first {
+                items = items + ", ";
+            }
+            first = false;
+            let name = json_escape(a.name);
+            items = items + "{l}\"id\": {a.id}, \"name\": \"{name}\", \"kind\": {a.kind}, \"balance\": {a.balance}{r}";
+        }
+        let balanced = trial_balance_ok(s);
+        return ok("{l}\"accounts\": [{items}], \"balanced\": {balanced}{r}");
+    }
+    if top == "days" && req.method == "POST" {
+        if !json_has(req.body, "day") {
+            return bad_request("day is required");
+        }
+        let d = json_int(req.body, "day");
+        if d < api.day {
+            return bad_request("day cannot go backwards");
+        }
+        mutation_day(api, req);
+        let now = api.day;
+        return ok(json_wrap("day", str(now)));
+    }
+    if top == "customers" {
+        return route_customers(api, req);
+    }
+    if top == "plans" {
+        return route_plans(api, req);
+    }
+    if top == "subscriptions" {
+        return route_subscriptions(api, req);
+    }
+    if top == "invoices" {
+        return route_invoices(api, req);
+    }
+    if top == "payments" {
+        return route_payments(api, req);
+    }
+    return not_found();
+}
+
+fn main() {
+    let store = new_store(13, 14, 10);
+    open_account(store, 100, "Cash", 0);
+    open_account(store, 110, "Accounts Receivable", 0);
+    open_account(store, 210, "Tax Payable", 1);
+    open_account(store, 220, "Deferred Revenue", 1);
+    open_account(store, 230, "Customer Credits", 1);
+    open_account(store, 400, "Subscription Revenue", 3);
+    open_account(store, 410, "Usage Revenue", 3);
+    let api = Api { store: store, day: 0 };
+
+    let port = 8790;
+    let env_port = env_get("BILLING_API_PORT");
+    if len(env_port) > 0 {
+        port = int(env_port);
+    }
+    let srv = http_listen(port);
+    check srv >= 0;
+    print("billing api listening on port {port}");
+    while true {
+        let h = http_accept(srv);
+        if h > 0 {
+            let req = read_request(h);
+            let resp = route(api, req);
+            let sent = respond_json(h, resp);
+            check sent;
+        }
+    }
+}

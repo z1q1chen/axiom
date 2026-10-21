@@ -5,6 +5,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <unistd.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 typedef enum { AX_INT, AX_FLOAT, AX_BOOL, AX_STR, AX_ARR, AX_OBJ, AX_MAP, AX_VOID } AxTag;
 
@@ -630,6 +634,20 @@ static int ax_starts_with(AxVal s, AxVal prefix) {
         ax_fail("type error: starts_with() needs two strings");
     return strncmp(s.u.s, prefix.u.s, strlen(prefix.u.s)) == 0;
 }
+/* chr(code): the one-byte string for a byte value (code & 0xFF).
+   ord(s): the first byte of s as an int, -1 for "". Byte-level
+   on purpose: they exist for parsers (JSON, URL decoding). */
+static AxVal ax_chr(int64_t code) {
+    char buf[2];
+    buf[0] = (char)(code & 0xFF);
+    buf[1] = 0;
+    return ax_str(buf);
+}
+static int64_t ax_ord_of(AxVal s) {
+    if (s.tag != AX_STR) ax_fail("type error: ord() needs a string");
+    if (s.u.s[0] == 0) return -1;
+    return (unsigned char)s.u.s[0];
+}
 
 /* ---- native bindings (extern fn implementations) ----
    Every `extern fn name(...)` in Axiom binds to axn_name here.
@@ -716,5 +734,236 @@ static AxVal axn_env_get(AxVal name) {
     if (name.tag != AX_STR) ax_fail("type error: env_get name");
     const char *v = getenv(name.u.s);
     return ax_str(v ? v : "");
+}
+
+/* ==== capability: http (pull-model server) ====
+   The Axiom program owns the accept loop: http_listen returns
+   a server handle, http_accept blocks for one request and
+   returns a request handle, the program reads the request
+   through the http_req_* natives, then answers once with
+   http_respond, which sends the response and closes the
+   connection (HTTP/1.1 with Connection: close; one request per
+   connection). Internal buffers use plain malloc and are freed
+   on respond; only copies handed to Axiom use ax_alloc, so the
+   GC sees exactly the strings the program holds. Limits:
+   64 KB of headers, 1 MB of body, 128 pending request slots.
+   The path is NOT percent-decoded (query values are decoded
+   Axiom-side by the framework); the server is single-threaded
+   and sequential by design. */
+
+#define AX_HTTP_SLOTS 128
+#define AX_HTTP_HDR_MAX 65536
+#define AX_HTTP_BODY_MAX 1048576
+
+typedef struct {
+    int used;
+    int fd;
+    char *method;
+    char *path;
+    char *query;
+    char *headers; /* raw header block, request line excluded */
+    char *body;
+} AxHttpSlot;
+
+static AxHttpSlot ax_http_slots[AX_HTTP_SLOTS];
+
+static AxHttpSlot *ax_http_get(AxVal h) {
+    if (h.tag != AX_INT) return NULL;
+    int64_t i = h.u.i;
+    if (i < 1 || i > AX_HTTP_SLOTS) return NULL;
+    AxHttpSlot *s = &ax_http_slots[i - 1];
+    return s->used ? s : NULL;
+}
+
+static char *ax_http_dup_range(const char *p, size_t n) {
+    char *r = (char *)malloc(n + 1);
+    if (!r) { fprintf(stderr, "axiom: out of memory\n"); exit(70); }
+    memcpy(r, p, n);
+    r[n] = 0;
+    return r;
+}
+
+/* Read until needle appears in buf or the cap is hit.
+   Returns the total bytes read, or -1 on error/EOF. */
+static long ax_http_read_until(int fd, char *buf, size_t cap, const char *needle) {
+    size_t n = 0;
+    size_t nlen = strlen(needle);
+    while (n < cap) {
+        ssize_t r = recv(fd, buf + n, cap - n, 0);
+        if (r <= 0) return n > 0 ? (long)n : -1;
+        n += (size_t)r;
+        buf[n] = 0;
+        if (n >= nlen && strstr(buf, needle)) break;
+    }
+    return (long)n;
+}
+
+static AxVal axn_http_listen(AxVal port) {
+    if (port.tag != AX_INT) ax_fail("type error: http_listen port");
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return ax_int(-1);
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port.u.i);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 32) != 0) {
+        close(fd);
+        return ax_int(-1);
+    }
+    return ax_int(fd);
+}
+
+static AxVal axn_http_accept(AxVal server) {
+    if (server.tag != AX_INT) ax_fail("type error: http_accept server");
+    int cfd = accept((int)server.u.i, NULL, NULL);
+    if (cfd < 0) return ax_int(0);
+    char *raw = (char *)malloc(AX_HTTP_HDR_MAX + AX_HTTP_BODY_MAX + 2);
+    if (!raw) { close(cfd); return ax_int(0); }
+    long n = ax_http_read_until(cfd, raw, AX_HTTP_HDR_MAX + 1, "\r\n\r\n");
+    if (n <= 0) { free(raw); close(cfd); return ax_int(0); }
+    char *hdr_end = strstr(raw, "\r\n\r\n");
+    size_t hdr_len = (size_t)(hdr_end - raw) + 4;
+    /* Content-Length, case-insensitive key scan. */
+    long content_len = 0;
+    {
+        const char *p = raw;
+        while (p < hdr_end) {
+            const char *eol = strstr(p, "\r\n");
+            if (!eol) break;
+            if (strncasecmp(p, "Content-Length:", 15) == 0)
+                content_len = strtol(p + 15, NULL, 10);
+            p = eol + 2;
+        }
+    }
+    if (content_len < 0) content_len = 0;
+    if (content_len > AX_HTTP_BODY_MAX) content_len = AX_HTTP_BODY_MAX;
+    size_t have_body = (size_t)n - hdr_len;
+    while ((long)have_body < content_len) {
+        ssize_t r = recv(cfd, raw + hdr_len + have_body,
+                         (size_t)content_len - have_body, 0);
+        if (r <= 0) break;
+        have_body += (size_t)r;
+    }
+    raw[hdr_len + have_body] = 0;
+    /* Request line: METHOD SP TARGET SP VERSION */
+    char *sp1 = strchr(raw, ' ');
+    char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
+    char *le = strstr(raw, "\r\n");
+    if (!sp1 || !sp2 || !le) { free(raw); close(cfd); return ax_int(0); }
+    char *method = ax_http_dup_range(raw, (size_t)(sp1 - raw));
+    char *target = ax_http_dup_range(sp1 + 1, (size_t)(sp2 - sp1 - 1));
+    char *headers = ax_http_dup_range(le + 2, (size_t)(hdr_end - (le + 2)));
+    char *body = ax_http_dup_range(raw + hdr_len, have_body);
+    free(raw);
+    char *q = strchr(target, '?');
+    char *path = target;
+    char *query = (char *)"";
+    if (q) { *q = 0; query = q + 1; }
+    int slot = -1;
+    for (int i = 0; i < AX_HTTP_SLOTS; i++) {
+        if (!ax_http_slots[i].used) { slot = i; break; }
+    }
+    if (slot < 0) {
+        free(method); free(target); free(headers); free(body);
+        close(cfd);
+        return ax_int(0);
+    }
+    AxHttpSlot *s = &ax_http_slots[slot];
+    s->used = 1;
+    s->fd = cfd;
+    s->method = method;
+    s->path = path;
+    s->query = ax_http_dup_range(query, strlen(query));
+    s->headers = headers;
+    s->body = body;
+    return ax_int(slot + 1);
+}
+
+static const char *ax_http_reason(int64_t code) {
+    switch (code) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
+        case 422: return "Unprocessable Entity";
+        case 500: return "Internal Server Error";
+        default: return "Status";
+    }
+}
+
+static AxVal axn_http_req_method(AxVal h) {
+    AxHttpSlot *s = ax_http_get(h);
+    return ax_str(s ? s->method : "");
+}
+static AxVal axn_http_req_path(AxVal h) {
+    AxHttpSlot *s = ax_http_get(h);
+    return ax_str(s ? s->path : "");
+}
+static AxVal axn_http_req_query(AxVal h) {
+    AxHttpSlot *s = ax_http_get(h);
+    return ax_str(s ? s->query : "");
+}
+static AxVal axn_http_req_body(AxVal h) {
+    AxHttpSlot *s = ax_http_get(h);
+    return ax_str(s ? s->body : "");
+}
+static AxVal axn_http_req_header(AxVal h, AxVal name) {
+    AxHttpSlot *s = ax_http_get(h);
+    if (!s || name.tag != AX_STR) return ax_str("");
+    size_t nl = strlen(name.u.s);
+    const char *p = s->headers;
+    while (p && *p) {
+        const char *eol = strstr(p, "\r\n");
+        size_t linelen = eol ? (size_t)(eol - p) : strlen(p);
+        if (linelen > nl + 1 && p[nl] == ':' &&
+            strncasecmp(p, name.u.s, nl) == 0) {
+            const char *v = p + nl + 1;
+            const char *vend = p + linelen;
+            while (v < vend && (*v == ' ' || *v == '\t')) v++;
+            while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t')) vend--;
+            char *tmp = ax_http_dup_range(v, (size_t)(vend - v));
+            AxVal r = ax_str(tmp);
+            free(tmp);
+            return r;
+        }
+        p = eol ? eol + 2 : NULL;
+    }
+    return ax_str("");
+}
+
+static AxVal axn_http_respond(AxVal h, AxVal status, AxVal ctype, AxVal body) {
+    AxHttpSlot *s = ax_http_get(h);
+    if (!s || status.tag != AX_INT || ctype.tag != AX_STR || body.tag != AX_STR)
+        return ax_bool(0);
+    size_t blen = strlen(body.u.s);
+    char head[512];
+    int hn = snprintf(head, sizeof(head),
+        "HTTP/1.1 %lld %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+        (long long)status.u.i, ax_http_reason(status.u.i), ctype.u.s, blen);
+    size_t off = 0;
+    const char *parts[2] = { head, body.u.s };
+    size_t lens[2] = { (size_t)hn, blen };
+    int ok = 1;
+    for (int pi = 0; pi < 2 && ok; pi++) {
+        off = 0;
+        while (off < lens[pi]) {
+            ssize_t w = send(s->fd, parts[pi] + off, lens[pi] - off, MSG_NOSIGNAL);
+            if (w <= 0) { ok = 0; break; }
+            off += (size_t)w;
+        }
+    }
+    close(s->fd);
+    free(s->method); free(s->path); free(s->query);
+    free(s->headers); free(s->body);
+    s->used = 0;
+    s->method = s->path = s->query = s->headers = s->body = NULL;
+    return ax_bool(ok);
 }
 /* end of Axiom runtime */

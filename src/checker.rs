@@ -185,6 +185,7 @@ pub struct TProgram {
 const BUILTINS: &[&str] = &[
     "print", "len", "push", "range", "str", "int", "float", "raise", "has", "keys", "del",
     "split", "join", "replace", "substr", "index_of", "starts_with", "gc_collect",
+    "chr", "ord",
 ];
 
 struct FnSig {
@@ -1711,6 +1712,26 @@ impl Checker {
                     return Err(arity("0", args.len()));
                 }
                 Ok(te(TExprKind::Builtin(name.into(), vec![]), Type::Int))
+            }
+            "chr" => {
+                if args.len() != 1 {
+                    return Err(arity("1", args.len()));
+                }
+                let a = self.check_expr(&args[0], None)?;
+                if a.ty != Type::Int {
+                    return self.err(span, "chr() needs an int");
+                }
+                Ok(te(TExprKind::Builtin(name.into(), vec![a]), Type::Str))
+            }
+            "ord" => {
+                if args.len() != 1 {
+                    return Err(arity("1", args.len()));
+                }
+                let a = self.check_expr(&args[0], None)?;
+                if a.ty != Type::Str {
+                    return self.err(span, "ord() needs a string");
+                }
+                Ok(te(TExprKind::Builtin(name.into(), vec![a]), Type::Int))
             }
             "len" => {
                 if args.len() != 1 {

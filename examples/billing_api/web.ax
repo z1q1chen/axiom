@@ -1,0 +1,262 @@
+// web.ax: a tiny web framework for Axiom, written in Axiom.
+//
+// The native side (capability http) is a pull model: the
+// program listens, blocks in http_accept for one request, reads
+// it, routes it, and answers with http_respond. This file wraps
+// the raw handles in a Request struct (parsed path segments and
+// query map), a Response struct, and the parsing helpers an API
+// needs: query strings, URL decoding, and flat-JSON field
+// extraction.
+//
+// JSON extraction is deliberately small: flat objects, string
+// values without escape sequences, int and bool values. That
+// covers this API's inputs; responses are built by the app with
+// json_escape on every string it emits.
+
+capability http {
+    extern fn http_listen(port: int) -> int;
+    extern fn http_accept(server: int) -> int;
+    extern fn http_req_method(req: int) -> string;
+    extern fn http_req_path(req: int) -> string;
+    extern fn http_req_query(req: int) -> string;
+    extern fn http_req_body(req: int) -> string;
+    extern fn http_req_header(req: int, name: string) -> string;
+    extern fn http_respond(req: int, status: int, content_type: string, body: string) -> bool;
+}
+
+capability io {
+    extern fn env_get(name: string) -> string;
+}
+
+struct Request {
+    method: string;
+    path: string;
+    parts: [string];
+    query: {string: string};
+    body: string;
+}
+
+struct Response {
+    status: int;
+    body: string;
+}
+
+fn hex_val(c: string) -> int {
+    let o = ord(c);
+    if o >= 48 && o <= 57 {
+        return o - 48;
+    }
+    if o >= 97 && o <= 102 {
+        return o - 87;
+    }
+    if o >= 65 && o <= 70 {
+        return o - 55;
+    }
+    return -1;
+}
+
+// Percent-decoding, byte-wise: %XX sequences reassemble into
+// the original bytes, and Axiom strings are byte strings.
+fn url_decode(s: string) -> string {
+    let out = "";
+    let i = 0;
+    while i < len(s) {
+        let c = substr(s, i, 1);
+        if c == "%" && i + 2 < len(s) {
+            let h1 = hex_val(substr(s, i + 1, 1));
+            let h2 = hex_val(substr(s, i + 2, 1));
+            if h1 >= 0 && h2 >= 0 {
+                out = out + chr(h1 * 16 + h2);
+                i = i + 3;
+            } else {
+                out = out + c;
+                i = i + 1;
+            }
+        } else if c == "+" {
+            out = out + " ";
+            i = i + 1;
+        } else {
+            out = out + c;
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn parse_query(q: string) -> {string: string} {
+    let m: {string: string} = {};
+    if len(q) == 0 {
+        return m;
+    }
+    let pairs = split(q, "&");
+    for pair in pairs {
+        let eq = index_of(pair, "=");
+        if eq < 0 {
+            m[url_decode(pair)] = "";
+        } else {
+            let k = substr(pair, 0, eq);
+            let v = substr(pair, eq + 1, len(pair) - eq - 1);
+            m[url_decode(k)] = url_decode(v);
+        }
+    }
+    return m;
+}
+
+fn read_request(h: int) -> Request {
+    let path = http_req_path(h);
+    return Request {
+        method: http_req_method(h),
+        path: path,
+        parts: split(path, "/"),
+        query: parse_query(http_req_query(h)),
+        body: http_req_body(h)
+    };
+}
+
+// Path segment i (parts[0] is "" for absolute paths); "" when
+// the path is shorter.
+fn seg(req: Request, i: int) -> string {
+    if i < len(req.parts) {
+        return req.parts[i];
+    }
+    return "";
+}
+
+fn respond_json(h: int, r: Response) -> bool {
+    return http_respond(h, r.status, "application/json", r.body);
+}
+
+fn ok(body: string) -> Response {
+    return Response { status: 200, body: body };
+}
+
+fn created(body: string) -> Response {
+    return Response { status: 201, body: body };
+}
+
+fn bad_request(msg: string) -> Response {
+    let q = chr(34);
+    return Response {
+        status: 400,
+        body: json_wrap("error", q + json_escape(msg) + q)
+    };
+}
+
+fn conflict(msg: string) -> Response {
+    let q = chr(34);
+    return Response {
+        status: 409,
+        body: json_wrap("error", q + json_escape(msg) + q)
+    };
+}
+
+fn not_found() -> Response {
+    let q = chr(34);
+    return Response {
+        status: 404,
+        body: json_wrap("error", q + "not found" + q)
+    };
+}
+
+// {"key": inner} — braces come from chr() because literal
+// braces inside an interpolated string start an interpolation.
+fn json_wrap(key: string, inner: string) -> string {
+    let l = chr(123);
+    let r = chr(125);
+    let q = chr(34);
+    return "{l}{q}{key}{q}: {inner}{r}";
+}
+
+// Escape a string for inclusion in a JSON string literal.
+fn json_escape(s: string) -> string {
+    let t = replace(s, "\\", "\\\\");
+    let u = replace(t, "\"", "\\\"");
+    let v = replace(u, "\n", "\\n");
+    return replace(v, "\t", "\\t");
+}
+
+// --- flat JSON field extraction ---
+
+// Offset just past the value colon for "key", or -1.
+fn json_value_at(body: string, key: string) -> int {
+    let q = chr(34);
+    let needle = q + key + q;
+    let i = index_of(body, needle);
+    if i < 0 {
+        return -1;
+    }
+    let rest = substr(body, i + len(needle), len(body));
+    let c = index_of(rest, ":");
+    if c < 0 {
+        return -1;
+    }
+    let at = i + len(needle) + c + 1;
+    // Skip spaces and tabs.
+    let j = at;
+    while j < len(body) {
+        let o = ord(substr(body, j, 1));
+        if o == 32 || o == 9 {
+            j = j + 1;
+        } else {
+            return j;
+        }
+    }
+    return j;
+}
+
+fn json_has(body: string, key: string) -> bool {
+    return json_value_at(body, key) >= 0;
+}
+
+fn json_str(body: string, key: string) -> string {
+    let q = chr(34);
+    let at = json_value_at(body, key);
+    if at < 0 {
+        return "";
+    }
+    if substr(body, at, 1) != q {
+        return "";
+    }
+    let rest = substr(body, at + 1, len(body));
+    let close = index_of(rest, q);
+    if close < 0 {
+        return "";
+    }
+    return substr(rest, 0, close);
+}
+
+fn json_int(body: string, key: string) -> int {
+    let at = json_value_at(body, key);
+    if at < 0 {
+        return 0;
+    }
+    let neg = false;
+    let v = 0;
+    let j = at;
+    if j < len(body) && ord(substr(body, j, 1)) == 45 {
+        neg = true;
+        j = j + 1;
+    }
+    let done = false;
+    while j < len(body) && !done {
+        let o = ord(substr(body, j, 1));
+        if o >= 48 && o <= 57 {
+            v = v * 10 + (o - 48);
+            j = j + 1;
+        } else {
+            done = true;
+        }
+    }
+    if neg {
+        return 0 - v;
+    }
+    return v;
+}
+
+fn json_bool(body: string, key: string) -> bool {
+    let at = json_value_at(body, key);
+    if at < 0 {
+        return false;
+    }
+    return starts_with(substr(body, at, len(body)), "true");
+}

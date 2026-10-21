@@ -681,6 +681,8 @@ impl<'a> CodeGen<'a> {
                     "starts_with" => format!("ax_bool(ax_starts_with({}, {}))", parts[0], parts[1]),
                     "raise" => format!("({{ ax_raise({}); ax_void(); }})", parts[0]),
                     "gc_collect" => "ax_gc_collect_builtin()".to_string(),
+                    "chr" => format!("ax_chr(({}).u.i)", parts[0]),
+                    "ord" => format!("ax_int(ax_ord_of({}))", parts[0]),
                     _ => "ax_void()".to_string(),
                 }
             }

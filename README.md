@@ -13,13 +13,17 @@ program, and records every one of them in a **verification ledger**.
 
 ## Status
 
-v0.9, built 2026-10-21. A working language, not the full design
+v0.10, built 2026-10-21. A working language, not the full design
 proposal: the proof tier is on the roadmap in `DESIGN.md`, not in
 this build. Contracts are runtime-checked (bound for externs,
 bounded where `axiomc verify` has exhausted a domain), and the
 ledger and verify report say exactly that.
 
-v0.9 adds an opt-in garbage collector (`--gc`): precise
+v0.10 adds a server runtime: an `http` capability (pull-model:
+listen / accept / read / respond) plus a small web framework
+written in Axiom itself, and the billing engine served as a
+JSON API under `examples/billing_api/` (run it, then
+`curl localhost:8790/health`). v0.9 added an opt-in garbage collector (`--gc`): precise
 mark-sweep over kind-tagged allocations, rooted by generated
 shadow stacks, collecting only at statement boundaries. v0.8
 added separate compilation (`axiomc build --separate`): one

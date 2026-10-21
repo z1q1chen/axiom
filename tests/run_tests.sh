@@ -93,6 +93,32 @@ else
 fi
 rm -f /tmp/rockstore_test.db
 
+# Billing API: build the server, drive it with curl, and check
+# the books through its own trial-balance endpoint.
+$AX build examples/billing_api/api.ax -o /tmp/axapi_test >/dev/null 2>&1
+BILLING_API_PORT=18799 /tmp/axapi_test >/dev/null 2>&1 &
+api_pid=$!
+sleep 1
+api_base="http://127.0.0.1:18799"
+api_ok=1
+curl -s $api_base/health | grep -q '"ok": true' || api_ok=0
+curl -s -X POST $api_base/plans -d '{"name":"Pro","price_cents":5000,"period_days":30,"trial_days":0,"usage_cents":10}' >/dev/null
+curl -s -X POST $api_base/customers -d '{"name":"Alice","email":"alice@example.com"}' >/dev/null
+curl -s -X POST $api_base/subscriptions -d '{"customer_id":1,"plan_id":1,"day":0}' >/dev/null
+curl -s -X POST $api_base/invoices/1/pay -d '{"amount":5650}' | grep -q '"paid": true' || api_ok=0
+tb="$(curl -s $api_base/trial-balance)"
+printf '%s' "$tb" | grep -q '"balanced": true' || api_ok=0
+printf '%s' "$tb" | grep -q '"id": 100, "name": "Cash", "kind": 0, "balance": 5650' || api_ok=0
+[ "$(curl -s -o /dev/null -w '%{http_code}' $api_base/invoices/999)" = "404" ] || api_ok=0
+kill $api_pid 2>/dev/null
+wait $api_pid 2>/dev/null
+if [ $api_ok -eq 1 ]; then
+    echo "PASS api"
+else
+    echo "FAIL api"
+    fail=1
+fi
+
 # GC stress: constant collection (threshold 50) while a
 # persistent structure must survive; live blocks stay bounded.
 gc_out="$(AXIOM_GC_THRESHOLD=50 $AX run tests/gc_stress.ax --gc 2>/dev/null)"
