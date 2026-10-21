@@ -13,16 +13,19 @@ program, and records every one of them in a **verification ledger**.
 
 ## Status
 
-v0.3, built 2026-10-21. A working language, not the full design
+v0.4, built 2026-10-21. A working language, not the full design
 proposal: formal proof tiers and capability binding are on the
 roadmap in `DESIGN.md`, not in this build. Contracts are
 runtime-checked, and the ledger says exactly that.
 
-v0.3 adds methods (`impl` blocks, `obj.m(args)`) and string
-interpolation (`"total: {inv.total}"`, with `{{` / `}}` as literal
-braces). See `examples/methods.ax`. v0.2 added maps (`{string: int}`
-style, int or string keys) with `has` / `keys` / `del`, plus a
-`split` builtin. See `examples/wordcount.ax`.
+v0.4 adds generics: generic structs and functions, monomorphized
+per instantiation, type arguments explicit or inferred (including
+return position). See `examples/generics.ax`. v0.3 added methods
+(`impl` blocks, `obj.m(args)`) and string interpolation
+(`"total: {inv.total}"`, with `{{` / `}}` as literal braces). See
+`examples/methods.ax`. v0.2 added maps (`{string: int}` style, int
+or string keys) with `has` / `keys` / `del`, plus a `split`
+builtin. See `examples/wordcount.ax`.
 
 ## Quick start
 

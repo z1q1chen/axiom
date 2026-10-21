@@ -19,6 +19,8 @@ pub enum TypeExpr {
     Array(Box<TypeExpr>),
     Map(Box<TypeExpr>, Box<TypeExpr>),
     Named(String),
+    // Generic struct application: Pair<int, string>
+    Generic(String, Vec<TypeExpr>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -45,6 +47,7 @@ pub struct Invariant {
 #[derive(Clone, Debug)]
 pub struct StructDef {
     pub name: String,
+    pub type_params: Vec<String>,
     pub fields: Vec<(String, TypeExpr)>,
     pub invariants: Vec<Invariant>,
     pub span: Span,
@@ -53,6 +56,7 @@ pub struct StructDef {
 #[derive(Clone, Debug)]
 pub struct FnDef {
     pub name: String,
+    pub type_params: Vec<String>,
     pub params: Vec<(String, TypeExpr)>,
     pub ret: TypeExpr,
     pub contracts: Vec<Contract>,
@@ -112,7 +116,11 @@ pub enum Expr {
     Ident(String, Span),
     Array(Vec<Expr>, Span),
     MapLit(Vec<(Expr, Expr)>, Span),
-    StructLit(String, Vec<(String, Expr)>, Span),
+    StructLit(String, Vec<TypeExpr>, Vec<(String, Expr)>, Span),
+    // Call with explicit type arguments: f<int>(args). The type
+    // arguments are resolved by the checker against the callee's
+    // type parameters.
+    GenericCall(String, Vec<TypeExpr>, Vec<Expr>, Span),
     Call(Box<Expr>, Vec<Expr>, Span),
     Field(Box<Expr>, String, Span),
     Index(Box<Expr>, Box<Expr>, Span),
@@ -125,7 +133,7 @@ impl Expr {
         match self {
             Expr::Int(_, s) | Expr::Float(_, s) | Expr::Bool(_, s) | Expr::Str(_, s)
             | Expr::Ident(_, s) | Expr::Array(_, s) | Expr::MapLit(_, s)
-            | Expr::StructLit(_, _, s)
+            | Expr::StructLit(_, _, _, s) | Expr::GenericCall(_, _, _, s)
             | Expr::Call(_, _, s) | Expr::Field(_, _, s) | Expr::Index(_, _, s)
             | Expr::Bin(_, _, _, s) | Expr::Un(_, _, s) => s,
         }

@@ -1,0 +1,62 @@
+// v0.4 (stage B): generic structs, monomorphized on demand.
+
+struct Pair<A, B> {
+    first: A;
+    second: B;
+}
+
+struct Stack<T> {
+    items: [T];
+    cap: int;
+    invariant len(items) <= cap;
+}
+
+fn first<T>(xs: [T]) -> T {
+    requires len(xs) > 0;
+    return xs[0];
+}
+
+fn make_pair<A, B>(a: A, b: B) -> Pair<A, B> {
+    return Pair { first: a, second: b };
+}
+
+fn empty<T>() -> [T] {
+    let xs: [T] = [];
+    return xs;
+}
+
+fn count_from<T>(xs: [T], i: int) -> int {
+    if i >= len(xs) {
+        return 0;
+    }
+    return 1 + count_from(xs, i + 1);
+}
+
+fn main() {
+    // Explicit type arguments.
+    let p = Pair<int, string> { first: 7, second: "seven" };
+    print("{p.first} is {p.second}");
+
+    // Inferred from field values.
+    let q = Pair { first: "a", second: true };
+    print("{q.first} {q.second}");
+
+    // Driven by the annotation; the invariant is checked on the
+    // instantiated struct.
+    let st: Stack<int> = Stack { items: [1, 2], cap: 3 };
+    push(st.items, 3);
+    print("stack len {len(st.items)} cap {st.cap}");
+
+    // Nested instantiation.
+    let nested = Pair { first: p, second: 9 };
+    print("nested {nested.first.second} and {nested.second}");
+
+    // Generic functions: inferred, explicit, return-position.
+    let nums = [10, 20, 30];
+    let words = ["x", "y"];
+    print("first is {first(nums)} and {first<string>(words)}");
+    let mp = make_pair("age", 36);
+    print("made {mp.first} {mp.second}");
+    let ys: [string] = empty();
+    print("empty len {len(ys)}, counted {count_from(nums, 0)}");
+}

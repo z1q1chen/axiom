@@ -1,6 +1,6 @@
 // Axiom type checker: AST -> typed AST (TProgram) or first error.
 use crate::ast::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
@@ -12,6 +12,13 @@ pub enum Type {
     Array(Box<Type>),
     Map(Box<Type>, Box<Type>),
     Struct(String),
+    // A type parameter inside a generic template (never survives
+    // into a checked program: instantiation substitutes it away).
+    Param(String),
+    // A generic struct applied to arguments that still contain
+    // parameters. Concrete applications become Type::Struct of the
+    // mangled instantiation name.
+    GenericApp(String, Vec<Type>),
 }
 
 impl Type {
@@ -25,7 +32,58 @@ impl Type {
             Type::Array(t) => format!("[{}]", t.name()),
             Type::Map(k, v) => format!("{{{}: {}}}", k.name(), v.name()),
             Type::Struct(n) => n.clone(),
+            Type::Param(n) => n.clone(),
+            Type::GenericApp(n, args) => format!(
+                "{}<{}>",
+                n,
+                args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")
+            ),
         }
+    }
+}
+
+fn mangle_type(ty: &Type) -> String {
+    match ty {
+        Type::Int => "int".into(),
+        Type::Float => "float".into(),
+        Type::Bool => "bool".into(),
+        Type::Str => "string".into(),
+        Type::Void => "void".into(),
+        Type::Array(t) => format!("arr_{}", mangle_type(t)),
+        Type::Map(k, v) => format!("map_{}_{}", mangle_type(k), mangle_type(v)),
+        Type::Struct(n) => n.clone(),
+        Type::Param(n) => format!("param_{}", n),
+        Type::GenericApp(n, args) => format!(
+            "{}__{}",
+            n,
+            args.iter().map(mangle_type).collect::<Vec<_>>().join("__")
+        ),
+    }
+}
+
+fn type_is_concrete(ty: &Type) -> bool {
+    match ty {
+        Type::Param(_) => false,
+        Type::Array(t) => type_is_concrete(t),
+        Type::Map(k, v) => type_is_concrete(k) && type_is_concrete(v),
+        Type::GenericApp(_, args) => args.iter().all(type_is_concrete),
+        _ => true,
+    }
+}
+
+fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Param(p) => subst.get(p).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Array(t) => Type::Array(Box::new(subst_type(t, subst))),
+        Type::Map(k, v) => Type::Map(
+            Box::new(subst_type(k, subst)),
+            Box::new(subst_type(v, subst)),
+        ),
+        Type::GenericApp(n, args) => Type::GenericApp(
+            n.clone(),
+            args.iter().map(|a| subst_type(a, subst)).collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -140,6 +198,22 @@ pub struct Checker {
     cur_ret: Type,
     cur_fn: String,
     loop_depth: u32,
+    // Generic struct templates by base name, and the type
+    // substitution active while resolving inside a template or an
+    // instantiation (type parameter name -> type).
+    generic_structs: HashMap<String, StructDef>,
+    type_subst: HashMap<String, Type>,
+    // Generic function templates and their pattern signatures,
+    // plus the instantiation work queue (definition, substitution,
+    // mangled name) drained after pass 4.
+    generic_fns: HashMap<String, FnDef>,
+    generic_sigs: HashMap<String, FnSig>,
+    fn_pending: Vec<(FnDef, HashMap<String, Type>, String)>,
+    fn_seen: HashSet<String>,
+    // Mangled instantiation name -> (base name, type arguments).
+    inst_args: HashMap<String, (String, Vec<Type>)>,
+    // TStructs created by instantiation, merged at the end.
+    extra_tstructs: Vec<TStruct>,
 }
 
 // The name a function is registered and generated under: methods
@@ -168,10 +242,18 @@ impl Checker {
             cur_ret: Type::Void,
             cur_fn: String::new(),
             loop_depth: 0,
+            generic_structs: HashMap::new(),
+            type_subst: HashMap::new(),
+            generic_fns: HashMap::new(),
+            generic_sigs: HashMap::new(),
+            fn_pending: Vec::new(),
+            fn_seen: HashSet::new(),
+            inst_args: HashMap::new(),
+            extra_tstructs: Vec::new(),
         }
     }
 
-    fn resolve(&self, t: &TypeExpr, span: &Span) -> Result<Type, String> {
+    fn resolve(&mut self, t: &TypeExpr, span: &Span) -> Result<Type, String> {
         Ok(match t {
             TypeExpr::Int => Type::Int,
             TypeExpr::Float => Type::Float,
@@ -192,7 +274,14 @@ impl Checker {
                 Type::Map(Box::new(kt), Box::new(self.resolve(v, span)?))
             }
             TypeExpr::Named(name) => {
-                if self.struct_fields.contains_key(name) || self.struct_ids.contains_key(name) {
+                if let Some(t) = self.type_subst.get(name) {
+                    t.clone()
+                } else if self.generic_structs.contains_key(name) {
+                    return Err(format!(
+                        "{}:{}: generic struct '{}' needs type arguments, e.g. {}<...>",
+                        span.file, span.line, name, name
+                    ));
+                } else if self.struct_fields.contains_key(name) || self.struct_ids.contains_key(name) {
                     Type::Struct(name.clone())
                 } else {
                     return Err(format!(
@@ -201,7 +290,175 @@ impl Checker {
                     ));
                 }
             }
+            TypeExpr::Generic(name, arg_exprs) => {
+                let template = match self.generic_structs.get(name) {
+                    Some(t) => t.clone(),
+                    None => {
+                        return Err(format!(
+                            "{}:{}: unknown generic struct '{}'",
+                            span.file, span.line, name
+                        ))
+                    }
+                };
+                if arg_exprs.len() != template.type_params.len() {
+                    return Err(format!(
+                        "{}:{}: generic struct '{}' takes {} type arguments, got {}",
+                        span.file,
+                        span.line,
+                        name,
+                        template.type_params.len(),
+                        arg_exprs.len()
+                    ));
+                }
+                let mut args = Vec::new();
+                for a in arg_exprs {
+                    args.push(self.resolve(a, span)?);
+                }
+                if args.iter().all(type_is_concrete) {
+                    Type::Struct(self.instantiate_struct(name, &args, span)?)
+                } else {
+                    Type::GenericApp(name.clone(), args)
+                }
+            }
         })
+    }
+
+    // Monomorphize a generic struct for concrete type arguments:
+    // register the mangled instantiation (fields substituted,
+    // invariants checked) exactly once and return its name.
+    fn instantiate_struct(
+        &mut self,
+        base: &str,
+        args: &[Type],
+        span: &Span,
+    ) -> Result<String, String> {
+        let mangled = format!(
+            "{}__{}",
+            base,
+            args.iter().map(mangle_type).collect::<Vec<_>>().join("__")
+        );
+        if self.struct_ids.contains_key(&mangled) {
+            return Ok(mangled);
+        }
+        let template = self.generic_structs[base].clone();
+        // Register the id before resolving fields so recursive
+        // instantiations (Node<T> containing Node<T>) terminate.
+        let id = self.struct_ids.len();
+        self.struct_ids.insert(mangled.clone(), id);
+        self.struct_has_inv
+            .insert(mangled.clone(), !template.invariants.is_empty());
+        self.inst_args
+            .insert(mangled.clone(), (base.to_string(), args.to_vec()));
+        let subst: HashMap<String, Type> = template
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        let saved = std::mem::replace(&mut self.type_subst, subst);
+        let mut fields = Vec::new();
+        let mut field_res: Result<(), String> = Ok(());
+        for (fname, fty) in &template.fields {
+            match self.resolve(fty, span) {
+                Ok(t) => fields.push((fname.clone(), t)),
+                Err(e) => {
+                    field_res = Err(e);
+                    break;
+                }
+            }
+        }
+        self.type_subst = saved;
+        field_res?;
+        self.struct_fields.insert(mangled.clone(), fields.clone());
+        let invariants = self.check_invariants_for(&template, &fields)?;
+        self.extra_tstructs.push(TStruct {
+            name: mangled.clone(),
+            fields,
+            invariants,
+            id,
+        });
+        Ok(mangled)
+    }
+
+    fn check_invariants_for(
+        &mut self,
+        def: &StructDef,
+        fields: &[(String, Type)],
+    ) -> Result<Vec<TInvariant>, String> {
+        let mut scope = HashMap::new();
+        for (fname, fty) in fields {
+            scope.insert(fname.clone(), fty.clone());
+        }
+        self.scopes.push(scope);
+        let mut out = Vec::new();
+        let mut res: Result<(), String> = Ok(());
+        for inv in &def.invariants {
+            match self.check_expr(&inv.expr, None) {
+                Ok(e) => {
+                    if e.ty != Type::Bool {
+                        res = self.err(&inv.span, "invariant must be a bool expression");
+                        break;
+                    }
+                    out.push(TInvariant {
+                        expr: e,
+                        text: inv.text.clone(),
+                        file: inv.span.file.clone(),
+                        line: inv.span.line,
+                    });
+                }
+                Err(e) => {
+                    res = Err(e);
+                    break;
+                }
+            }
+        }
+        self.scopes.pop();
+        res?;
+        Ok(out)
+    }
+
+    // Unify a pattern type (may contain type parameters) with a
+    // concrete type, recording parameter bindings. Returns false
+    // when the shapes cannot match.
+    fn unify(
+        &self,
+        pat: &Type,
+        conc: &Type,
+        bindings: &mut HashMap<String, Type>,
+    ) -> bool {
+        match (pat, conc) {
+            (Type::Param(p), c) => match bindings.get(p) {
+                Some(prev) => prev == c,
+                None => {
+                    bindings.insert(p.clone(), c.clone());
+                    true
+                }
+            },
+            (Type::Array(a), Type::Array(b)) => self.unify(a, b, bindings),
+            (Type::Map(k1, v1), Type::Map(k2, v2)) => {
+                self.unify(k1, k2, bindings) && self.unify(v1, v2, bindings)
+            }
+            (Type::GenericApp(n1, a1), Type::GenericApp(n2, a2)) => {
+                n1 == n2
+                    && a1.len() == a2.len()
+                    && a1.iter()
+                        .zip(a2.iter())
+                        .all(|(x, y)| self.unify(x, y, bindings))
+            }
+            (Type::GenericApp(n, pats), Type::Struct(m)) => {
+                match self.inst_args.get(m) {
+                    Some((base, cargs)) => {
+                        base == n
+                            && pats.len() == cargs.len()
+                            && pats.iter()
+                                .zip(cargs.iter())
+                                .all(|(x, y)| self.unify(x, y, bindings))
+                    }
+                    None => false,
+                }
+            }
+            (a, b) => a == b,
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<Type> {
@@ -211,6 +468,118 @@ impl Checker {
             }
         }
         self.globals.get(name).cloned()
+    }
+
+    // A literal of a generic struct: determine the type arguments
+    // (explicit, from the expected type, or inferred from field
+    // values), instantiate, then re-check as a concrete literal.
+    fn check_generic_struct_lit(
+        &mut self,
+        name: &str,
+        targs: &[TypeExpr],
+        fields: &[(String, Expr)],
+        span: &Span,
+        expected: Option<&Type>,
+    ) -> Result<TExpr, String> {
+        let template = self.generic_structs[name].clone();
+        let mut bindings: HashMap<String, Type> = HashMap::new();
+        if !targs.is_empty() {
+            if targs.len() != template.type_params.len() {
+                return self.err(
+                    span,
+                    &format!(
+                        "generic struct '{}' takes {} type arguments, got {}",
+                        name,
+                        template.type_params.len(),
+                        targs.len()
+                    ),
+                );
+            }
+            for (p, te) in template.type_params.iter().zip(targs.iter()) {
+                let t = self.resolve(te, span)?;
+                bindings.insert(p.clone(), t);
+            }
+        } else if let Some(exp) = expected {
+            let from: Option<Vec<Type>> = match exp {
+                Type::GenericApp(b, args) if b == name => Some(args.clone()),
+                Type::Struct(m) => match self.inst_args.get(m) {
+                    Some((b, args)) if b == name => Some(args.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(args) = from {
+                for (p, a) in template.type_params.iter().zip(args.iter()) {
+                    bindings.insert(p.clone(), a.clone());
+                }
+            }
+        }
+        if bindings.len() < template.type_params.len() {
+            // Infer from field values against pattern field types.
+            let saved = std::mem::replace(
+                &mut self.type_subst,
+                template
+                    .type_params
+                    .iter()
+                    .map(|p| (p.clone(), Type::Param(p.clone())))
+                    .collect(),
+            );
+            let mut pat_fields: Vec<(String, Type)> = Vec::new();
+            let mut pat_res: Result<(), String> = Ok(());
+            for (fname, fty) in &template.fields {
+                match self.resolve(fty, span) {
+                    Ok(t) => pat_fields.push((fname.clone(), t)),
+                    Err(e) => {
+                        pat_res = Err(e);
+                        break;
+                    }
+                }
+            }
+            self.type_subst = saved;
+            pat_res?;
+            for (fname, fexpr) in fields {
+                let pat = match pat_fields.iter().find(|(n, _)| n == fname) {
+                    Some((_, t)) => t.clone(),
+                    None => {
+                        return self.err(
+                            span,
+                            &format!("struct '{}' has no field '{}'", name, fname),
+                        )
+                    }
+                };
+                let v = self.check_expr(fexpr, None)?;
+                if !self.unify(&pat, &v.ty, &mut bindings) {
+                    return self.err(
+                        span,
+                        &format!(
+                            "field '{}' of '{}' does not determine the type arguments",
+                            fname, name
+                        ),
+                    );
+                }
+            }
+        }
+        let mut args = Vec::new();
+        for p in &template.type_params {
+            match bindings.get(p) {
+                Some(t) => args.push(t.clone()),
+                None => {
+                    return self.err(
+                        span,
+                        &format!(
+                            "cannot infer type argument '{}' for struct '{}'; write it explicitly, e.g. {}<...>",
+                            p, name, name
+                        ),
+                    )
+                }
+            }
+        }
+        if !args.iter().all(type_is_concrete) {
+            return self.err(span, "generic struct type arguments must be concrete here");
+        }
+        let mangled = self.instantiate_struct(name, &args, span)?;
+        let lit = Expr::StructLit(mangled, Vec::new(), fields.to_vec(), span.clone());
+        self.check_expr(&lit, expected)
     }
 
     fn err<T>(&self, span: &Span, msg: &str) -> Result<T, String> {
@@ -225,16 +594,29 @@ impl Checker {
         for item in &prog.items {
             match item {
                 Item::Struct(s) => {
-                    if self.struct_ids.contains_key(&s.name) {
+                    if self.struct_ids.contains_key(&s.name)
+                        || self.generic_structs.contains_key(&s.name) {
                         return Err(format!(
                             "{}:{}: duplicate struct '{}'",
                             s.span.file, s.span.line, s.name
                         ));
                     }
-                    let id = self.struct_ids.len();
-                    self.struct_ids.insert(s.name.clone(), id);
-                    self.struct_has_inv.insert(s.name.clone(), !s.invariants.is_empty());
-                    struct_defs.push(s);
+                    if s.type_params.is_empty() {
+                        let id = self.struct_ids.len();
+                        self.struct_ids.insert(s.name.clone(), id);
+                        self.struct_has_inv.insert(s.name.clone(), !s.invariants.is_empty());
+                        struct_defs.push(s);
+                    } else {
+                        for (i, (fname, _)) in s.fields.iter().enumerate() {
+                            if s.fields[..i].iter().any(|(n, _)| n == fname) {
+                                return Err(format!(
+                                    "{}:{}: duplicate field '{}' in struct '{}'",
+                                    s.span.file, s.span.line, fname, s.name
+                                ));
+                            }
+                        }
+                        self.generic_structs.insert(s.name.clone(), s.clone());
+                    }
                 }
                 Item::Fn(f) => {
                     if BUILTINS.contains(&f.name.as_str()) {
@@ -279,6 +661,47 @@ impl Checker {
             self.struct_fields.insert(s.name.clone(), fields);
         }
         for f in &fn_defs {
+            if !f.type_params.is_empty() {
+                if f.owner.is_some() {
+                    return Err(format!(
+                        "{}:{}: generic methods are not supported yet",
+                        f.span.file, f.span.line
+                    ));
+                }
+                // Pattern signature: type parameters resolve to
+                // Type::Param under a self-substitution.
+                let saved = std::mem::replace(
+                    &mut self.type_subst,
+                    f.type_params
+                        .iter()
+                        .map(|p| (p.clone(), Type::Param(p.clone())))
+                        .collect(),
+                );
+                let mut params = Vec::new();
+                let mut res: Result<(), String> = Ok(());
+                for (pname, pty) in &f.params {
+                    match self.resolve(pty, &f.span) {
+                        Ok(t) => params.push((pname.clone(), t)),
+                        Err(e) => {
+                            res = Err(e);
+                            break;
+                        }
+                    }
+                }
+                let mut ret = Type::Void;
+                if res.is_ok() {
+                    match self.resolve(&f.ret, &f.span) {
+                        Ok(t) => ret = t,
+                        Err(e) => res = Err(e),
+                    }
+                }
+                self.type_subst = saved;
+                res?;
+                self.generic_sigs
+                    .insert(f.name.clone(), FnSig { params, ret });
+                self.generic_fns.insert(f.name.clone(), (*f).clone());
+                continue;
+            }
             let mut params = Vec::new();
             for (pname, pty) in &f.params {
                 params.push((pname.clone(), self.resolve(pty, &f.span)?));
@@ -286,6 +709,12 @@ impl Checker {
             let ret = self.resolve(&f.ret, &f.span)?;
             let reg = reg_name(f);
             if let Some(o) = &f.owner {
+                if self.generic_structs.contains_key(o) {
+                    return Err(format!(
+                        "{}:{}: methods on generic structs are not supported yet ('{}')",
+                        f.span.file, f.span.line, o
+                    ));
+                }
                 if params.is_empty() || params[0].0 != "self"
                     || params[0].1 != Type::Struct(o.clone()) {
                     return Err(format!(
@@ -302,25 +731,7 @@ impl Checker {
         let mut tstructs = Vec::new();
         for s in &struct_defs {
             let fields = self.struct_fields[s.name.as_str()].clone();
-            let mut scope = HashMap::new();
-            for (fname, fty) in &fields {
-                scope.insert(fname.clone(), fty.clone());
-            }
-            self.scopes.push(scope);
-            let mut invariants = Vec::new();
-            for inv in &s.invariants {
-                let e = self.check_expr(&inv.expr, None)?;
-                if e.ty != Type::Bool {
-                    return self.err(&inv.span, "invariant must be a bool expression");
-                }
-                invariants.push(TInvariant {
-                    expr: e,
-                    text: inv.text.clone(),
-                    file: inv.span.file.clone(),
-                    line: inv.span.line,
-                });
-            }
-            self.scopes.pop();
+            let invariants = self.check_invariants_for(s, &fields)?;
             tstructs.push(TStruct {
                 name: s.name.clone(),
                 fields,
@@ -358,6 +769,9 @@ impl Checker {
         }
 
         // Pass 4: functions.
+        if self.generic_fns.contains_key("main") {
+            return Err("main cannot be generic".to_string());
+        }
         if !self.fns.contains_key("main") {
             return Err("program has no main function".to_string());
         }
@@ -366,70 +780,247 @@ impl Checker {
         }
         let mut tfns = Vec::new();
         for f in &fn_defs {
+            if !f.type_params.is_empty() {
+                continue;
+            }
             let reg = reg_name(f);
             let sig = self.fns[reg.as_str()].clone_sig();
-            self.cur_ret = sig.ret.clone();
-            self.cur_fn = reg.clone();
-            self.loop_depth = 0;
-            // Contracts.
-            let mut scope: HashMap<String, Type> = HashMap::new();
-            for (pname, pty) in &sig.params {
-                scope.insert(pname.clone(), pty.clone());
-            }
-            self.scopes.push(scope);
-            let mut tcontracts = Vec::new();
-            for c in &f.contracts {
-                if c.kind == ContractKind::Ensures {
-                    if sig.ret == Type::Void {
-                        return self.err(
-                            &c.span,
-                            "ensures requires a non-void return type",
-                        );
-                    }
-                    self.scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert("result".to_string(), sig.ret.clone());
-                }
-                let e = self.check_expr(&c.expr, None)?;
-                if e.ty != Type::Bool {
-                    return self.err(&c.span, "contract clause must be a bool expression");
-                }
-                if c.kind == ContractKind::Ensures {
-                    self.scopes.last_mut().unwrap().remove("result");
-                }
-                tcontracts.push(TContract {
-                    kind: c.kind,
-                    expr: e,
-                    text: c.text.clone(),
-                    file: c.span.file.clone(),
-                    line: c.span.line,
-                });
-            }
-            // Body (same scope as params).
-            let mut tbody = Vec::new();
-            for stmt in &f.body {
-                tbody.push(self.check_stmt(stmt)?);
-            }
-            self.scopes.pop();
-            if sig.ret != Type::Void && !ends_with_return(&f.body) {
-                return Err(format!(
-                    "{}:{}: function '{}' may end without returning a value",
-                    f.span.file, f.span.line, f.name
-                ));
-            }
-            tfns.push(TFn {
-                name: reg,
-                params: sig.params,
-                ret: sig.ret,
-                contracts: tcontracts,
-                body: tbody,
-                file: f.span.file.clone(),
-                line: f.span.line,
-            });
+            tfns.push(self.check_one_fn(f, &sig, &reg)?);
+        }
+        // Drain the generic instantiation queue; checking one
+        // instance may queue more.
+        let mut qi = 0;
+        while qi < self.fn_pending.len() {
+            let (def, subst, reg) = self.fn_pending[qi].clone();
+            qi += 1;
+            let sig = self.fns[reg.as_str()].clone_sig();
+            let saved = std::mem::replace(&mut self.type_subst, subst);
+            let r = self.check_one_fn(&def, &sig, &reg);
+            self.type_subst = saved;
+            tfns.push(r?);
         }
 
-        Ok(TProgram { structs: tstructs, fns: tfns, globals: tglobals })
+        let mut all_structs = tstructs;
+        all_structs.extend(self.extra_tstructs.clone());
+        all_structs.sort_by_key(|s| s.id);
+        Ok(TProgram { structs: all_structs, fns: tfns, globals: tglobals })
+    }
+
+    // Check one function (concrete or a generic instantiation)
+    // against a concrete signature.
+    fn check_one_fn(
+        &mut self,
+        f: &FnDef,
+        sig: &FnSig,
+        reg: &str,
+    ) -> Result<TFn, String> {
+        self.cur_ret = sig.ret.clone();
+        self.cur_fn = reg.to_string();
+        self.loop_depth = 0;
+        let mut scope: HashMap<String, Type> = HashMap::new();
+        for (pname, pty) in &sig.params {
+            scope.insert(pname.clone(), pty.clone());
+        }
+        self.scopes.push(scope);
+        let mut tcontracts = Vec::new();
+        for c in &f.contracts {
+            if c.kind == ContractKind::Ensures {
+                if sig.ret == Type::Void {
+                    return self.err(&c.span, "ensures requires a non-void return type");
+                }
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert("result".to_string(), sig.ret.clone());
+            }
+            let e = self.check_expr(&c.expr, None)?;
+            if e.ty != Type::Bool {
+                return self.err(&c.span, "contract clause must be a bool expression");
+            }
+            if c.kind == ContractKind::Ensures {
+                self.scopes.last_mut().unwrap().remove("result");
+            }
+            tcontracts.push(TContract {
+                kind: c.kind,
+                expr: e,
+                text: c.text.clone(),
+                file: c.span.file.clone(),
+                line: c.span.line,
+            });
+        }
+        let mut tbody = Vec::new();
+        for stmt in &f.body {
+            tbody.push(self.check_stmt(stmt)?);
+        }
+        self.scopes.pop();
+        if sig.ret != Type::Void && !ends_with_return(&f.body) {
+            return Err(format!(
+                "{}:{}: function '{}' may end without returning a value",
+                f.span.file, f.span.line, f.name
+            ));
+        }
+        Ok(TFn {
+            name: reg.to_string(),
+            params: sig.params.clone(),
+            ret: sig.ret.clone(),
+            contracts: tcontracts,
+            body: tbody,
+            file: f.span.file.clone(),
+            line: f.span.line,
+        })
+    }
+
+    // Replace any fully-applied generic struct in a type with its
+    // monomorphized instantiation.
+    fn concretize(&mut self, ty: &Type, span: &Span) -> Result<Type, String> {
+        Ok(match ty {
+            Type::Array(t) => Type::Array(Box::new(self.concretize(t, span)?)),
+            Type::Map(k, v) => Type::Map(
+                Box::new(self.concretize(k, span)?),
+                Box::new(self.concretize(v, span)?),
+            ),
+            Type::GenericApp(n, args) => {
+                let mut cargs = Vec::new();
+                for a in args {
+                    cargs.push(self.concretize(a, span)?);
+                }
+                if cargs.iter().all(type_is_concrete) {
+                    Type::Struct(self.instantiate_struct(n, &cargs, span)?)
+                } else {
+                    Type::GenericApp(n.clone(), cargs)
+                }
+            }
+            other => other.clone(),
+        })
+    }
+
+    // Register (once) the monomorphization of a generic function
+    // for concrete type bindings and queue its body for checking.
+    fn instantiate_fn(
+        &mut self,
+        name: &str,
+        bindings: &HashMap<String, Type>,
+        span: &Span,
+    ) -> Result<String, String> {
+        let template = self.generic_fns[name].clone();
+        let ordered: Vec<Type> = template
+            .type_params
+            .iter()
+            .map(|p| bindings[p].clone())
+            .collect();
+        let reg = format!(
+            "{}__{}",
+            name,
+            ordered.iter().map(mangle_type).collect::<Vec<_>>().join("__")
+        );
+        if self.fn_seen.contains(&reg) {
+            return Ok(reg);
+        }
+        self.fn_seen.insert(reg.clone());
+        let pat = self.generic_sigs[name].clone_sig();
+        let mut params = Vec::new();
+        for (pname, pty) in &pat.params {
+            let t = self.concretize(&subst_type(pty, bindings), span)?;
+            params.push((pname.clone(), t));
+        }
+        let ret = self.concretize(&subst_type(&pat.ret, bindings), span)?;
+        self.fns.insert(reg.clone(), FnSig { params, ret });
+        self.fn_pending
+            .push((template, bindings.clone(), reg.clone()));
+        Ok(reg)
+    }
+
+    // A call to a generic function: infer the type bindings from
+    // explicit type arguments, argument types, and the expected
+    // result type, then instantiate.
+    fn check_generic_call(
+        &mut self,
+        name: &str,
+        targs: &[TypeExpr],
+        args: &[Expr],
+        span: &Span,
+        expected: Option<&Type>,
+    ) -> Result<TExpr, String> {
+        let template = self.generic_fns[name].clone();
+        let pat = self.generic_sigs[name].clone_sig();
+        if !targs.is_empty() && targs.len() != template.type_params.len() {
+            return self.err(
+                span,
+                &format!(
+                    "'{}' takes {} type arguments, got {}",
+                    name,
+                    template.type_params.len(),
+                    targs.len()
+                ),
+            );
+        }
+        let mut bindings: HashMap<String, Type> = HashMap::new();
+        for (p, te) in template.type_params.iter().zip(targs.iter()) {
+            let t = self.resolve(te, span)?;
+            bindings.insert(p.clone(), t);
+        }
+        if args.len() != pat.params.len() {
+            return self.err(
+                span,
+                &format!(
+                    "'{}' takes {} arguments, got {}",
+                    name,
+                    pat.params.len(),
+                    args.len()
+                ),
+            );
+        }
+        let mut targs_out = Vec::new();
+        for (arg, (_, pty)) in args.iter().zip(pat.params.iter()) {
+            let a = self.check_expr(arg, None)?;
+            if !self.unify(pty, &a.ty, &mut bindings) {
+                return self.err(
+                    span,
+                    &format!(
+                        "argument of '{}' has type {}, which does not match {}",
+                        name,
+                        a.ty.name(),
+                        pty.name()
+                    ),
+                );
+            }
+            targs_out.push(a);
+        }
+        if let Some(exp) = expected {
+            if !self.unify(&pat.ret, exp, &mut bindings) {
+                return self.err(
+                    span,
+                    &format!("'{}' cannot return {} here", name, exp.name()),
+                );
+            }
+        }
+        for p in &template.type_params {
+            if !bindings.contains_key(p) {
+                return self.err(
+                    span,
+                    &format!(
+                        "cannot infer type parameter '{}' of '{}'; use explicit type arguments",
+                        p, name
+                    ),
+                );
+            }
+        }
+        let reg = self.instantiate_fn(name, &bindings, span)?;
+        let sig = self.fns[reg.as_str()].clone_sig();
+        for (a, (_, pty)) in targs_out.iter().zip(sig.params.iter()) {
+            if a.ty != *pty {
+                return self.err(
+                    span,
+                    &format!(
+                        "argument of '{}' has type {}, expected {}",
+                        name,
+                        a.ty.name(),
+                        pty.name()
+                    ),
+                );
+            }
+        }
+        Ok(te(TExprKind::Call(reg, targs_out), sig.ret.clone()))
     }
 
     fn check_block(&mut self, stmts: &[Stmt]) -> Result<Vec<TStmt>, String> {
@@ -738,7 +1329,18 @@ impl Checker {
                 }
                 Ok(te(TExprKind::Array(out), Type::Array(Box::new(elem_ty))))
             }
-            Expr::StructLit(name, fields, span) => {
+            Expr::StructLit(name, targs, fields, span) => {
+                if self.generic_structs.contains_key(name.as_str()) {
+                    return self.check_generic_struct_lit(
+                        name, targs, fields, span, expected,
+                    );
+                }
+                if !targs.is_empty() {
+                    return self.err(
+                        span,
+                        &format!("struct '{}' is not generic", name),
+                    );
+                }
                 if !self.struct_fields.contains_key(name.as_str()) {
                     return self.err(span, &format!("unknown struct '{}'", name));
                 }
@@ -795,6 +1397,24 @@ impl Checker {
                     TExprKind::StructLit(id, name.clone(), pairs),
                     Type::Struct(name.clone()),
                 ))
+            }
+            Expr::GenericCall(name, targs, args, span) => {
+                if self.generic_fns.contains_key(name.as_str()) {
+                    return self.check_generic_call(name, targs, args, span, expected);
+                }
+                if BUILTINS.contains(&name.as_str()) {
+                    return self.err(
+                        span,
+                        &format!("builtin '{}' does not take type arguments", name),
+                    );
+                }
+                if self.fns.contains_key(name.as_str()) {
+                    return self.err(
+                        span,
+                        &format!("'{}' is not a generic function", name),
+                    );
+                }
+                self.err(span, &format!("unknown function '{}'", name))
             }
             Expr::Call(callee, args, span) => {
                 // Method call: base.method(args) resolves through the
@@ -896,6 +1516,9 @@ impl Checker {
                     }
                     let ret = sig.ret.clone();
                     return Ok(te(TExprKind::Call(name, targs), ret));
+                }
+                if self.generic_fns.contains_key(&name) {
+                    return self.check_generic_call(&name, &[], args, span, expected);
                 }
                 if BUILTINS.contains(&name.as_str()) {
                     return self.check_builtin(&name, args, span);

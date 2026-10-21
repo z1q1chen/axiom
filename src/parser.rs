@@ -151,13 +151,72 @@ impl<'a> Parser<'a> {
             "bool" => TypeExpr::Bool,
             "string" => TypeExpr::Str,
             "void" => TypeExpr::Void,
-            _ => TypeExpr::Named(name),
+            _ => {
+                if *self.peek() == Tok::Lt {
+                    self.bump();
+                    let mut args = vec![self.parse_type()?];
+                    while self.eat(&Tok::Comma) {
+                        args.push(self.parse_type()?);
+                    }
+                    self.expect(&Tok::Gt, "'>'")?;
+                    TypeExpr::Generic(name, args)
+                } else {
+                    TypeExpr::Named(name)
+                }
+            }
         })
+    }
+
+    // Optional `<T, U>` type parameter list after a definition name.
+    fn parse_type_params(&mut self) -> Result<Vec<String>, String> {
+        let mut out = Vec::new();
+        if *self.peek() == Tok::Lt {
+            self.bump();
+            loop {
+                let (p, _) = self.ident()?;
+                out.push(p);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::Gt, "'>'")?;
+        }
+        Ok(out)
+    }
+
+    // Speculative `<type, ...>` type argument list. Restores the
+    // token position and returns None when the shape does not fit,
+    // so `a < b` keeps parsing as a comparison.
+    fn try_type_args(&mut self) -> Option<Vec<TypeExpr>> {
+        if *self.peek() != Tok::Lt {
+            return None;
+        }
+        let save = self.pos;
+        self.bump();
+        let mut args = Vec::new();
+        loop {
+            match self.parse_type() {
+                Ok(t) => args.push(t),
+                Err(_) => {
+                    self.pos = save;
+                    return None;
+                }
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        if !self.eat(&Tok::Gt) {
+            self.pos = save;
+            return None;
+        }
+        Some(args)
     }
 
     fn parse_struct(&mut self) -> Result<StructDef, String> {
         let start = self.expect(&Tok::Struct, "'struct'")?.span;
         let (name, _) = self.ident()?;
+        let type_params = self.parse_type_params()?;
         self.expect(&Tok::LBrace, "'{'")?;
         let mut fields = Vec::new();
         let mut invariants = Vec::new();
@@ -167,6 +226,7 @@ impl<'a> Parser<'a> {
                     let end = self.bump().span;
                     return Ok(StructDef {
                         name,
+                        type_params,
                         fields,
                         invariants,
                         span: self.merge(&start, &end),
@@ -212,6 +272,7 @@ impl<'a> Parser<'a> {
     fn parse_fn(&mut self, owner: Option<String>) -> Result<FnDef, String> {
         let start = self.expect(&Tok::Fn, "'fn'")?.span;
         let (name, _) = self.ident()?;
+        let type_params = self.parse_type_params()?;
         self.expect(&Tok::LParen, "'('")?;
         let mut params = Vec::new();
         if *self.peek() != Tok::RParen {
@@ -255,7 +316,7 @@ impl<'a> Parser<'a> {
             contracts.push(Contract { kind, expr: e, text, span });
         }
         let body = self.parse_stmts_until_rbrace()?;
-        Ok(FnDef { name, params, ret, contracts, body, span: start_span(&start, &self.file), owner })
+        Ok(FnDef { name, type_params, params, ret, contracts, body, span: start_span(&start, &self.file), owner })
     }
 
     fn parse_stmts_until_rbrace(&mut self) -> Result<Vec<Stmt>, String> {
@@ -632,6 +693,75 @@ impl<'a> Parser<'a> {
         Ok(acc)
     }
 
+    // The field list of a struct literal, braces included.
+    fn parse_struct_fields(&mut self) -> Result<(Vec<(String, Expr)>, Span), String> {
+        self.bump(); // '{'
+        let mut fields = Vec::new();
+        if *self.peek() != Tok::RBrace {
+            loop {
+                let (fname, _) = self.ident()?;
+                self.expect(&Tok::Colon, "':'")?;
+                let fe = self.parse_expr()?;
+                fields.push((fname, fe));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+                if *self.peek() == Tok::RBrace {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(&Tok::RBrace, "'}'")?.span;
+        Ok((fields, end))
+    }
+
+    // `Name<type, ...>` followed by a struct literal or a call.
+    // Returns None (with the position restored) when the tokens do
+    // not have that shape, so comparisons still parse normally.
+    fn try_generic_syntax(
+        &mut self,
+        name: &str,
+        start: &Span,
+    ) -> Result<Option<Expr>, String> {
+        let save = self.pos;
+        let targs = match self.try_type_args() {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        if self.struct_literal_ahead() {
+            let (fields, end) = self.parse_struct_fields()?;
+            let span = self.merge(start, &end);
+            return Ok(Some(Expr::StructLit(
+                name.to_string(),
+                targs,
+                fields,
+                span,
+            )));
+        }
+        if *self.peek() == Tok::LParen {
+            self.bump();
+            let mut args = Vec::new();
+            if *self.peek() != Tok::RParen {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            let end = self.expect(&Tok::RParen, "')'")?.span;
+            let span = self.merge(start, &end);
+            return Ok(Some(Expr::GenericCall(
+                name.to_string(),
+                targs,
+                args,
+                span,
+            )));
+        }
+        self.pos = save;
+        Ok(None)
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, String> {
         let t = self.bump();
         match t.tok {
@@ -642,26 +772,11 @@ impl<'a> Parser<'a> {
             Tok::False => Ok(Expr::Bool(false, t.span)),
             Tok::Ident(name) => {
                 if self.struct_literal_ahead() {
-                    // Struct literal.
-                    self.bump();
-                    let mut fields = Vec::new();
-                    if *self.peek() != Tok::RBrace {
-                        loop {
-                            let (fname, _) = self.ident()?;
-                            self.expect(&Tok::Colon, "':'")?;
-                            let fe = self.parse_expr()?;
-                            fields.push((fname, fe));
-                            if !self.eat(&Tok::Comma) {
-                                break;
-                            }
-                            if *self.peek() == Tok::RBrace {
-                                break;
-                            }
-                        }
-                    }
-                    let end = self.expect(&Tok::RBrace, "'}'")?.span;
+                    let (fields, end) = self.parse_struct_fields()?;
                     let span = self.merge(&t.span, &end);
-                    Ok(Expr::StructLit(name, fields, span))
+                    Ok(Expr::StructLit(name, Vec::new(), fields, span))
+                } else if let Some(e) = self.try_generic_syntax(&name, &t.span)? {
+                    Ok(e)
                 } else {
                     Ok(Expr::Ident(name, t.span))
                 }

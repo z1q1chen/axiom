@@ -124,11 +124,29 @@ concatenation with `str(...)` around each braced expression.
 `{{` and `}}` are literal braces; a lone `}` is a parse error.
 Braces nest and may contain string literals.
 
+## Generics (v0.4)
+
+Generic structs (`struct Pair<A, B> { ... }`) and generic
+functions (`fn first<T>(xs: [T]) -> T`) are monomorphized: each
+concrete instantiation is checked and generated as its own
+struct or function (`Pair__int__string`, `first__int`), with the
+template's invariants and contracts re-checked per instantiation.
+
+Type arguments come from, in order: explicit arguments
+(`Pair<int, string> { ... }`, `first<string>(words)`), the
+expected type at the use site (annotations, argument positions,
+return position), or inference from field values and argument
+types. Operations on a bare type parameter are limited to what
+every type supports (passing, storing, `==`, `len` on containers
+of it); there are no trait bounds yet, so `fn sum<T>(xs: [T])`
+cannot add elements. Generic methods and methods on generic
+structs are not supported yet.
+
 ## Roadmap (not in v0.1)
 
-- Generics.
 - Capability declarations with binding to pre-verified
   implementations (the proposal's capability layer).
 - Contract tiers above runtime-checked: bounded model checking of
   small pure functions; proof for a tiny critical core.
 - Freeing memory (a real allocator policy), separate compilation.
+- Trait bounds for generic parameters; generic methods.
