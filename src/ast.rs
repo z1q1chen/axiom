@@ -58,6 +58,8 @@ pub struct FnDef {
     pub contracts: Vec<Contract>,
     pub body: Vec<Stmt>,
     pub span: Span,
+    // Some(struct name) for methods declared in an `impl` block.
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug)]

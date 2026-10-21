@@ -1,0 +1,28 @@
+// v0.3: methods (impl blocks) and string interpolation.
+
+struct Counter {
+    n: int;
+    invariant n >= 0;
+}
+
+impl Counter {
+    fn bump(self, by: int) -> int {
+        requires by > 0;
+        self.n = self.n + by;
+        return self.n;
+    }
+
+    fn describe(self) -> string {
+        return "count is {self.n}";
+    }
+}
+
+fn main() {
+    let c = Counter { n: 0 };
+    c.bump(1);
+    let v = c.bump(2);
+    print(c.describe());
+    print("v={v}, half={v / 2}, literal braces: {{ok}}");
+    let who = "world";
+    print("hello {who}, sum={1 + 2 + 3}");
+}

@@ -134,11 +134,21 @@ pub struct Checker {
     struct_ids: HashMap<String, usize>,
     struct_has_inv: HashMap<String, bool>,
     fns: HashMap<String, FnSig>,
+    methods: HashMap<(String, String), String>,
     globals: HashMap<String, Type>,
     scopes: Vec<HashMap<String, Type>>,
     cur_ret: Type,
     cur_fn: String,
     loop_depth: u32,
+}
+
+// The name a function is registered and generated under: methods
+// are mangled to Struct__method so codegen sees plain identifiers.
+fn reg_name(f: &FnDef) -> String {
+    match &f.owner {
+        Some(o) => format!("{}__{}", o, f.name),
+        None => f.name.clone(),
+    }
 }
 
 fn te(kind: TExprKind, ty: Type) -> TExpr {
@@ -152,6 +162,7 @@ impl Checker {
             struct_ids: HashMap::new(),
             struct_has_inv: HashMap::new(),
             fns: HashMap::new(),
+            methods: HashMap::new(),
             globals: HashMap::new(),
             scopes: Vec::new(),
             cur_ret: Type::Void,
@@ -273,7 +284,18 @@ impl Checker {
                 params.push((pname.clone(), self.resolve(pty, &f.span)?));
             }
             let ret = self.resolve(&f.ret, &f.span)?;
-            self.fns.insert(f.name.clone(), FnSig { params, ret });
+            let reg = reg_name(f);
+            if let Some(o) = &f.owner {
+                if params.is_empty() || params[0].0 != "self"
+                    || params[0].1 != Type::Struct(o.clone()) {
+                    return Err(format!(
+                        "{}:{}: method '{}' must take 'self' of type {} as its first parameter",
+                        f.span.file, f.span.line, f.name, o
+                    ));
+                }
+                self.methods.insert((o.clone(), f.name.clone()), reg.clone());
+            }
+            self.fns.insert(reg, FnSig { params, ret });
         }
 
         // Pass 2: struct invariants.
@@ -344,9 +366,10 @@ impl Checker {
         }
         let mut tfns = Vec::new();
         for f in &fn_defs {
-            let sig = self.fns[f.name.as_str()].clone_sig();
+            let reg = reg_name(f);
+            let sig = self.fns[reg.as_str()].clone_sig();
             self.cur_ret = sig.ret.clone();
-            self.cur_fn = f.name.clone();
+            self.cur_fn = reg.clone();
             self.loop_depth = 0;
             // Contracts.
             let mut scope: HashMap<String, Type> = HashMap::new();
@@ -396,7 +419,7 @@ impl Checker {
                 ));
             }
             tfns.push(TFn {
-                name: f.name.clone(),
+                name: reg,
                 params: sig.params,
                 ret: sig.ret,
                 contracts: tcontracts,
@@ -774,6 +797,66 @@ impl Checker {
                 ))
             }
             Expr::Call(callee, args, span) => {
+                // Method call: base.method(args) resolves through the
+                // impl table to the mangled function, with the base
+                // expression checked as the self argument.
+                if let Expr::Field(obj, mname, _) = callee.as_ref() {
+                    let tobj = self.check_expr(obj, None)?;
+                    let sname = match &tobj.ty {
+                        Type::Struct(n) => n.clone(),
+                        other => {
+                            return self.err(
+                                span,
+                                &format!(
+                                    "method call on non-struct type {}",
+                                    other.name()
+                                ),
+                            )
+                        }
+                    };
+                    let reg = match self.methods.get(&(sname.clone(), mname.clone())) {
+                        Some(r) => r.clone(),
+                        None => {
+                            return self.err(
+                                span,
+                                &format!(
+                                    "struct '{}' has no method '{}'",
+                                    sname, mname
+                                ),
+                            )
+                        }
+                    };
+                    let sig = self.fns[reg.as_str()].clone_sig();
+                    if args.len() + 1 != sig.params.len() {
+                        return self.err(
+                            span,
+                            &format!(
+                                "method '{}' takes {} arguments, got {}",
+                                mname,
+                                sig.params.len() - 1,
+                                args.len()
+                            ),
+                        );
+                    }
+                    let mut targs = vec![tobj];
+                    for (arg, (_, pty)) in args.iter().zip(sig.params.iter().skip(1)) {
+                        let a = self.check_expr(arg, Some(pty))?;
+                        if a.ty != *pty {
+                            return self.err(
+                                span,
+                                &format!(
+                                    "argument of method '{}' has type {}, expected {}",
+                                    mname,
+                                    a.ty.name(),
+                                    pty.name()
+                                ),
+                            );
+                        }
+                        targs.push(a);
+                    }
+                    let ret = sig.ret.clone();
+                    return Ok(te(TExprKind::Call(reg, targs), ret));
+                }
                 let name = match callee.as_ref() {
                     Expr::Ident(n, _) => n.clone(),
                     _ => {

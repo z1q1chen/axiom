@@ -116,7 +116,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Tok::Struct => items.push(Item::Struct(self.parse_struct()?)),
-                Tok::Fn => items.push(Item::Fn(self.parse_fn()?)),
+                Tok::Fn => items.push(Item::Fn(self.parse_fn(None)?)),
+                Tok::Impl => items.extend(self.parse_impl()?),
                 Tok::Let => {
                     let (name, ann, expr, span) = self.parse_let_parts()?;
                     items.push(Item::Global(name, ann, expr, span));
@@ -196,7 +197,19 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_fn(&mut self) -> Result<FnDef, String> {
+    fn parse_impl(&mut self) -> Result<Vec<Item>, String> {
+        self.expect(&Tok::Impl, "'impl'")?;
+        let (name, _) = self.ident()?;
+        self.expect(&Tok::LBrace, "'{'")?;
+        let mut items = Vec::new();
+        while *self.peek() == Tok::Fn {
+            items.push(Item::Fn(self.parse_fn(Some(name.clone()))?));
+        }
+        self.expect(&Tok::RBrace, "'}'")?;
+        Ok(items)
+    }
+
+    fn parse_fn(&mut self, owner: Option<String>) -> Result<FnDef, String> {
         let start = self.expect(&Tok::Fn, "'fn'")?.span;
         let (name, _) = self.ident()?;
         self.expect(&Tok::LParen, "'('")?;
@@ -204,8 +217,15 @@ impl<'a> Parser<'a> {
         if *self.peek() != Tok::RParen {
             loop {
                 let (pname, _) = self.ident()?;
-                self.expect(&Tok::Colon, "':'")?;
-                let ty = self.parse_type()?;
+                // Inside an impl block, a bare `self` parameter takes
+                // the impl's struct type without an annotation.
+                let ty = if pname == "self" && owner.is_some()
+                    && *self.peek() != Tok::Colon {
+                    TypeExpr::Named(owner.clone().unwrap())
+                } else {
+                    self.expect(&Tok::Colon, "':'")?;
+                    self.parse_type()?
+                };
                 params.push((pname, ty));
                 if !self.eat(&Tok::Comma) {
                     break;
@@ -235,7 +255,7 @@ impl<'a> Parser<'a> {
             contracts.push(Contract { kind, expr: e, text, span });
         }
         let body = self.parse_stmts_until_rbrace()?;
-        Ok(FnDef { name, params, ret, contracts, body, span: start_span(&start, &self.file) })
+        Ok(FnDef { name, params, ret, contracts, body, span: start_span(&start, &self.file), owner })
     }
 
     fn parse_stmts_until_rbrace(&mut self) -> Result<Vec<Stmt>, String> {
@@ -515,12 +535,109 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
+    // String interpolation: "{expr}" inside a string literal is
+    // desugared to string concatenation with str(expr). "{{" and
+    // "}}" are literal braces. A lone "}" is an error. Strings
+    // without braces take the fast path and stay plain literals.
+    fn interpolate(&mut self, s: String, span: Span) -> Result<Expr, String> {
+        if !s.contains('{') && !s.contains('}') {
+            return Ok(Expr::Str(s, span));
+        }
+        fn utf8_len(b: u8) -> usize {
+            if b < 0x80 { 1 } else if b >= 0xF0 { 4 } else if b >= 0xE0 { 3 } else { 2 }
+        }
+        let bytes = s.as_bytes();
+        let mut parts: Vec<Expr> = Vec::new();
+        let mut lit = String::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'{' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                lit.push('{');
+                i += 2;
+                continue;
+            }
+            if b == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                lit.push('}');
+                i += 2;
+                continue;
+            }
+            if b == b'{' {
+                let start = i + 1;
+                let mut depth = 1i32;
+                let mut j = start;
+                let mut in_str = false;
+                while j < bytes.len() {
+                    let c = bytes[j];
+                    if in_str {
+                        if c == b'"' { in_str = false; }
+                    } else if c == b'"' {
+                        in_str = true;
+                    } else if c == b'{' {
+                        depth += 1;
+                    } else if c == b'}' {
+                        depth -= 1;
+                        if depth == 0 { break; }
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    return Err(format!(
+                        "{}:{}: parse error: unterminated '{{' in string interpolation",
+                        span.file, span.line
+                    ));
+                }
+                let inner = s[start..j].to_string();
+                if !lit.is_empty() {
+                    parts.push(Expr::Str(std::mem::take(&mut lit), span.clone()));
+                }
+                let toks = crate::lexer::lex(&inner, &span.file)?;
+                let mut sub = Parser::new(toks, &inner, &span.file);
+                let e = sub.parse_expr()?;
+                if *sub.peek() != Tok::Eof {
+                    return Err(format!(
+                        "{}:{}: parse error: trailing tokens in interpolation",
+                        span.file, span.line
+                    ));
+                }
+                parts.push(Expr::Call(
+                    Box::new(Expr::Ident("str".to_string(), span.clone())),
+                    vec![e],
+                    span.clone(),
+                ));
+                i = j + 1;
+                continue;
+            }
+            if b == b'}' {
+                return Err(format!(
+                    "{}:{}: parse error: unmatched '}}' in string; write '}}}}' for a literal brace",
+                    span.file, span.line
+                ));
+            }
+            let n = utf8_len(b);
+            lit.push_str(&s[i..i + n]);
+            i += n;
+        }
+        if !lit.is_empty() {
+            parts.push(Expr::Str(lit, span.clone()));
+        }
+        let mut iter = parts.into_iter();
+        let mut acc = match iter.next() {
+            Some(e) => e,
+            None => return Ok(Expr::Str(String::new(), span)),
+        };
+        for p in iter {
+            acc = Expr::Bin(BinOp::Add, Box::new(acc), Box::new(p), span.clone());
+        }
+        Ok(acc)
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, String> {
         let t = self.bump();
         match t.tok {
             Tok::Int(v) => Ok(Expr::Int(v, t.span)),
             Tok::Float(v) => Ok(Expr::Float(v, t.span)),
-            Tok::Str(s) => Ok(Expr::Str(s, t.span)),
+            Tok::Str(s) => self.interpolate(s, t.span),
             Tok::True => Ok(Expr::Bool(true, t.span)),
             Tok::False => Ok(Expr::Bool(false, t.span)),
             Tok::Ident(name) => {

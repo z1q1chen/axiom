@@ -32,11 +32,12 @@ reference.
 
 ```
 program   := item*
-item      := use | struct | fn | let            // top level
+item      := use | struct | impl | fn | let     // top level
 use       := "use" STRING ";"
 struct    := "struct" IDENT "{" field* invariant* "}"
 field     := IDENT ":" type ";"
 invariant := "invariant" expr ";"
+impl      := "impl" IDENT "{" fn* "}"           // methods (v0.3)
 fn        := "fn" IDENT "(" params? ")" ("->" type)? block
 block     := "{" contract* stmt* "}"
 contract  := ("requires" | "ensures") expr ";"
@@ -109,9 +110,23 @@ for the roadmap and are never claimed by this compiler.
 `==` compares ints, floats, bools by value and strings by content.
 Arrays and structs compare by identity in v0.1.
 
+## Methods and interpolation (v0.3)
+
+Methods are declared in `impl StructName { ... }` blocks. The
+first parameter must be `self`; written bare (`fn m(self, x: int)`)
+it takes the impl's struct type. Calls `obj.m(args)` resolve
+through the impl table; contracts and invariant checks behave
+exactly as for free functions (a field assignment to `self`
+re-checks the struct invariant).
+
+String literals interpolate: `"total: {inv.total}"` desugars to
+concatenation with `str(...)` around each braced expression.
+`{{` and `}}` are literal braces; a lone `}` is a parse error.
+Braces nest and may contain string literals.
+
 ## Roadmap (not in v0.1)
 
-- String interpolation, methods on structs, generics.
+- Generics.
 - Capability declarations with binding to pre-verified
   implementations (the proposal's capability layer).
 - Contract tiers above runtime-checked: bounded model checking of
