@@ -24,6 +24,7 @@ fn main() {
     let mut out: Option<String> = None;
     let mut emit_c = false;
     let mut separate = false;
+    let mut gc = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -37,6 +38,7 @@ fn main() {
             }
             "--emit-c" => emit_c = true,
             "--separate" => separate = true,
+            "--gc" => gc = true,
             other => {
                 eprintln!("axiomc: unknown option {}", other);
                 exit(2);
@@ -47,12 +49,16 @@ fn main() {
 
     let result = match cmd {
         "check" => cmd_check(&file),
+        "build" if separate && gc => Err(
+            "--gc is not supported with --separate yet (each module carries its own runtime state)"
+                .to_string(),
+        ),
         "build" if separate => cmd_build_separate(&file, out.as_deref()),
-        "build" => cmd_build(&file, out.as_deref(), emit_c, false),
+        "build" => cmd_build(&file, out.as_deref(), emit_c, false, gc),
         "run" if separate => Err(
             "run does not support --separate; build first, then run the binary".to_string(),
         ),
-        "run" => cmd_build(&file, out.as_deref(), emit_c, true),
+        "run" => cmd_build(&file, out.as_deref(), emit_c, true, gc),
         "verify" => cmd_verify(&file),
         _ => {
             usage();
@@ -125,8 +131,14 @@ fn load_and_check(file: &str) -> Result<checker::TProgram, String> {
 }
 
 fn compile(file: &str) -> Result<(checker::TProgram, String), String> {
+    compile_gc(file, false)
+}
+
+fn compile_gc(file: &str, gc: bool) -> Result<(checker::TProgram, String), String> {
     let tp = load_and_check(file)?;
-    let c = codegen::CodeGen::new(&tp).gen_program(&tp);
+    let mut cg = codegen::CodeGen::new(&tp);
+    cg.gc = gc;
+    let c = cg.gen_program(&tp);
     Ok((tp, c))
 }
 
@@ -390,8 +402,9 @@ fn cmd_build(
     out: Option<&str>,
     emit_c: bool,
     run: bool,
+    gc: bool,
 ) -> Result<(), String> {
-    let (tp, c_src) = compile(file)?;
+    let (tp, c_src) = compile_gc(file, gc)?;
     let stem = Path::new(file)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())

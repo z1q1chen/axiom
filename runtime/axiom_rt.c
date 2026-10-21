@@ -26,10 +26,181 @@ struct AxVal {
     } u;
 };
 
-static void *ax_alloc(size_t n) {
-    void *p = malloc(n ? n : 1);
-    if (!p) { fprintf(stderr, "axiom: out of memory\n"); exit(70); }
-    return p;
+/* ---- allocation registry and garbage collection ----
+   Every heap block carries a header recording its kind, so the
+   marker can traverse values precisely:
+     AXK_BYTES  leaf bytes (string payloads, scratch buffers)
+     AXK_VALS   an array of AxVal (array/object/map buffers)
+     AXK_ARR    AxArrData  (traverse its data buffer)
+     AXK_OBJ    AxObjData  (traverse its fields buffer)
+     AXK_MAP    AxMapData  (traverse its key/value buffers)
+   Collection only runs at generated statement boundaries when
+   the program was built with --gc: at those points every live
+   value is reachable from registered globals, the shadow root
+   stack (parameters and locals), or the temp root stack
+   (intermediate values of the current statement). */
+#define AXK_BYTES 0
+#define AXK_VALS 1
+#define AXK_ARR 2
+#define AXK_OBJ 3
+#define AXK_MAP 4
+
+typedef struct AxBlock {
+    struct AxBlock *next;
+    int kind;
+    int marked;
+    size_t size;
+} AxBlock;
+
+static AxBlock *ax_blocks = NULL;
+static long ax_alloc_since_gc = 0;
+static long ax_gc_threshold = 10000;
+static int ax_gc_on = 0;
+static long ax_gc_collections = 0;
+
+static void *ax_alloc_kind(size_t n, int kind) {
+    AxBlock *b = (AxBlock *)malloc(sizeof(AxBlock) + (n ? n : 1));
+    if (!b) { fprintf(stderr, "axiom: out of memory\n"); exit(70); }
+    b->next = ax_blocks;
+    b->kind = kind;
+    b->marked = 0;
+    b->size = n;
+    ax_blocks = b;
+    ax_alloc_since_gc++;
+    void *user = (void *)(b + 1);
+    if (kind == AXK_VALS) {
+        // Value buffers hold spare capacity beyond the live
+        // length; zero it so the marker sees harmless AX_INT
+        // slots (tag 0) instead of uninitialized memory.
+        memset(user, 0, n);
+    }
+    return user;
+}
+
+static void *ax_alloc(size_t n) { return ax_alloc_kind(n, AXK_BYTES); }
+
+static AxBlock *ax_block_of(void *user_ptr) {
+    return ((AxBlock *)user_ptr) - 1;
+}
+
+/* Root registration: globals (once, from the entry point) and
+   two runtime stacks maintained by generated code. */
+#define AX_ROOTS_MAX 4096
+static AxVal *ax_global_roots[AX_ROOTS_MAX];
+static int ax_global_root_count = 0;
+static void ax_root_global(AxVal *slot) {
+    if (ax_global_root_count < AX_ROOTS_MAX)
+        ax_global_roots[ax_global_root_count++] = slot;
+}
+
+static AxVal **ax_root_stack = NULL;
+static long ax_root_sp = 0, ax_root_cap = 0;
+static void ax_root_push(AxVal *slot) {
+    if (ax_root_sp == ax_root_cap) {
+        ax_root_cap = ax_root_cap ? ax_root_cap * 2 : 1024;
+        ax_root_stack = (AxVal **)realloc(ax_root_stack, sizeof(AxVal *) * (size_t)ax_root_cap);
+        if (!ax_root_stack) { fprintf(stderr, "axiom: out of memory\n"); exit(70); }
+    }
+    ax_root_stack[ax_root_sp++] = slot;
+}
+static void ax_root_pop(long n) { ax_root_sp -= n; }
+
+static AxVal **ax_temp_stack = NULL;
+static long ax_temp_sp = 0, ax_temp_cap = 0;
+static void ax_temp_push(AxVal *slot) {
+    if (ax_temp_sp == ax_temp_cap) {
+        ax_temp_cap = ax_temp_cap ? ax_temp_cap * 2 : 1024;
+        ax_temp_stack = (AxVal **)realloc(ax_temp_stack, sizeof(AxVal *) * (size_t)ax_temp_cap);
+        if (!ax_temp_stack) { fprintf(stderr, "axiom: out of memory\n"); exit(70); }
+    }
+    ax_temp_stack[ax_temp_sp++] = slot;
+}
+static long ax_temp_mark(void) { return ax_temp_sp; }
+static void ax_temp_pop(long mark) { ax_temp_sp = mark; }
+
+static void ax_mark_value(AxVal v);
+static void ax_mark_ptr(void *user_ptr) {
+    if (!user_ptr) return;
+    AxBlock *b = ax_block_of(user_ptr);
+    if (b->marked) return;
+    b->marked = 1;
+    if (b->kind == AXK_VALS) {
+        AxVal *vals = (AxVal *)user_ptr;
+        size_t count = b->size / sizeof(AxVal);
+        for (size_t i = 0; i < count; i++) ax_mark_value(vals[i]);
+    } else if (b->kind == AXK_ARR) {
+        AxArrData *a = (AxArrData *)user_ptr;
+        ax_mark_ptr(a->data);
+    } else if (b->kind == AXK_OBJ) {
+        AxObjData *o = (AxObjData *)user_ptr;
+        ax_mark_ptr(o->fields);
+    } else if (b->kind == AXK_MAP) {
+        AxMapData *m = (AxMapData *)user_ptr;
+        ax_mark_ptr(m->keys);
+        ax_mark_ptr(m->vals);
+    }
+}
+static void ax_mark_value(AxVal v) {
+    switch (v.tag) {
+        case AX_STR: ax_mark_ptr(v.u.s); break;
+        case AX_ARR: ax_mark_ptr(v.u.arr); break;
+        case AX_OBJ: ax_mark_ptr(v.u.obj); break;
+        case AX_MAP: ax_mark_ptr(v.u.map); break;
+        default: break;
+    }
+}
+
+static long ax_gc_collect_now(void) {
+    for (int i = 0; i < ax_global_root_count; i++)
+        ax_mark_value(*ax_global_roots[i]);
+    for (long i = 0; i < ax_root_sp; i++)
+        ax_mark_value(*ax_root_stack[i]);
+    for (long i = 0; i < ax_temp_sp; i++)
+        ax_mark_value(*ax_temp_stack[i]);
+    long live = 0;
+    AxBlock **pp = &ax_blocks;
+    while (*pp) {
+        AxBlock *b = *pp;
+        if (b->marked) {
+            b->marked = 0;
+            live++;
+            pp = &b->next;
+        } else {
+            *pp = b->next;
+            free(b);
+        }
+    }
+    ax_alloc_since_gc = 0;
+    ax_gc_collections++;
+    return live;
+}
+
+static void ax_gc_enable(void) {
+    const char *t = getenv("AXIOM_GC_THRESHOLD");
+    if (t && t[0]) {
+        long v = strtol(t, NULL, 10);
+        if (v > 0) ax_gc_threshold = v;
+    }
+    ax_gc_on = 1;
+}
+
+static void ax_gc_maybe(void) {
+    if (ax_gc_on && ax_alloc_since_gc >= ax_gc_threshold)
+        ax_gc_collect_now();
+}
+
+static AxVal ax_int(int64_t v)  { AxVal r; r.tag = AX_INT;   r.u.i = v; return r; }
+static AxVal ax_float(double v) { AxVal r; r.tag = AX_FLOAT; r.u.f = v; return r; }
+static AxVal ax_bool(int v)     { AxVal r; r.tag = AX_BOOL;  r.u.b = !!v; return r; }
+static AxVal ax_void(void)      { AxVal r; r.tag = AX_VOID;  r.u.i = 0; return r; }
+
+/* Builtin gc_collect(): forces a collection and returns the
+   number of live blocks. Only meaningful in --gc builds (the
+   root stacks exist only there); elsewhere it is a no-op
+   returning -1 so a stray call can never free live memory. */
+static AxVal ax_gc_collect_builtin(void) {
+    if (!ax_gc_on) return ax_int(-1);
+    return ax_int(ax_gc_collect_now());
 }
 
 static void ax_fail(const char *msg) {
@@ -43,11 +214,6 @@ static void ax_contract_fail(const char *kind, const char *owner,
             kind, owner, file, line, text);
     exit(70);
 }
-
-static AxVal ax_int(int64_t v)  { AxVal r; r.tag = AX_INT;   r.u.i = v; return r; }
-static AxVal ax_float(double v) { AxVal r; r.tag = AX_FLOAT; r.u.f = v; return r; }
-static AxVal ax_bool(int v)     { AxVal r; r.tag = AX_BOOL;  r.u.b = !!v; return r; }
-static AxVal ax_void(void)      { AxVal r; r.tag = AX_VOID;  r.u.i = 0; return r; }
 
 static char *ax_strdup(const char *s) {
     size_t n = strlen(s);
@@ -67,8 +233,8 @@ static int ax_truth(AxVal v) {
 
 /* ---- arrays ---- */
 static AxVal ax_arr_new(void) {
-    AxVal r; AxArrData *a = ax_alloc(sizeof(AxArrData));
-    a->len = 0; a->cap = 8; a->data = ax_alloc(sizeof(AxVal) * 8);
+    AxVal r; AxArrData *a = ax_alloc_kind(sizeof(AxArrData), AXK_ARR);
+    a->len = 0; a->cap = 8; a->data = ax_alloc_kind(sizeof(AxVal) * 8, AXK_VALS);
     r.tag = AX_ARR; r.u.arr = a; return r;
 }
 static AxVal ax_arr_push(AxVal arr, AxVal v) {
@@ -76,7 +242,7 @@ static AxVal ax_arr_push(AxVal arr, AxVal v) {
     AxArrData *a = arr.u.arr;
     if (a->len >= a->cap) {
         a->cap *= 2;
-        AxVal *nd = ax_alloc(sizeof(AxVal) * (size_t)a->cap);
+        AxVal *nd = ax_alloc_kind(sizeof(AxVal) * (size_t)a->cap, AXK_VALS);
         memcpy(nd, a->data, sizeof(AxVal) * (size_t)a->len);
         a->data = nd;
     }
@@ -103,9 +269,9 @@ static int64_t ax_len(AxVal v) {
 
 /* ---- objects (structs) ---- */
 static AxVal ax_obj_new(int32_t type_id, int32_t nfields) {
-    AxVal r; AxObjData *o = ax_alloc(sizeof(AxObjData));
+    AxVal r; AxObjData *o = ax_alloc_kind(sizeof(AxObjData), AXK_OBJ);
     o->type_id = type_id; o->nfields = nfields;
-    o->fields = ax_alloc(sizeof(AxVal) * (size_t)(nfields ? nfields : 1));
+    o->fields = ax_alloc_kind(sizeof(AxVal) * (size_t)(nfields ? nfields : 1), AXK_VALS);
     for (int32_t i = 0; i < nfields; i++) o->fields[i] = ax_void();
     r.tag = AX_OBJ; r.u.obj = o; return r;
 }
@@ -209,10 +375,10 @@ static AxVal ax_ge(AxVal a, AxVal b) { return ax_le(b, a); }
 
 /* ---- maps (linear scan; v0.2 scale) ---- */
 static AxVal ax_map_new(void) {
-    AxVal r; AxMapData *m = ax_alloc(sizeof(AxMapData));
+    AxVal r; AxMapData *m = ax_alloc_kind(sizeof(AxMapData), AXK_MAP);
     m->len = 0; m->cap = 8;
-    m->keys = ax_alloc(sizeof(AxVal) * 8);
-    m->vals = ax_alloc(sizeof(AxVal) * 8);
+    m->keys = ax_alloc_kind(sizeof(AxVal) * 8, AXK_VALS);
+    m->vals = ax_alloc_kind(sizeof(AxVal) * 8, AXK_VALS);
     r.tag = AX_MAP; r.u.map = m; return r;
 }
 static int64_t ax_map_find(AxVal map, AxVal key) {
@@ -231,8 +397,8 @@ static AxVal ax_map_set(AxVal map, AxVal key, AxVal val) {
     if (at >= 0) { m->vals[at] = val; return map; }
     if (m->len >= m->cap) {
         m->cap *= 2;
-        AxVal *nk = ax_alloc(sizeof(AxVal) * (size_t)m->cap);
-        AxVal *nv = ax_alloc(sizeof(AxVal) * (size_t)m->cap);
+        AxVal *nk = ax_alloc_kind(sizeof(AxVal) * (size_t)m->cap, AXK_VALS);
+        AxVal *nv = ax_alloc_kind(sizeof(AxVal) * (size_t)m->cap, AXK_VALS);
         memcpy(nk, m->keys, sizeof(AxVal) * (size_t)m->len);
         memcpy(nv, m->vals, sizeof(AxVal) * (size_t)m->len);
         m->keys = nk; m->vals = nv;

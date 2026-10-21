@@ -50,6 +50,16 @@ pub struct CodeGen<'a> {
     // Separate compilation: generated functions and invariant
     // checkers get external linkage so modules can link.
     pub separate: bool,
+    // Garbage collection (--gc): generated code maintains shadow
+    // root stacks and collects at statement boundaries.
+    pub gc: bool,
+    // Per-scope count of rooted locals (parallel to scopes);
+    // index 0 of a function counts body-level lets only,
+    // parameters are rooted separately.
+    scope_roots: Vec<usize>,
+    // Scope-stack index of the innermost loop's own scope, for
+    // computing how many roots break/continue must pop.
+    loop_marks: Vec<usize>,
 }
 
 impl<'a> CodeGen<'a> {
@@ -65,6 +75,9 @@ impl<'a> CodeGen<'a> {
             scopes: Vec::new(),
             tmp: 0,
             separate: false,
+            gc: false,
+            scope_roots: Vec::new(),
+            loop_marks: Vec::new(),
         }
     }
 
@@ -105,6 +118,12 @@ impl<'a> CodeGen<'a> {
         for g in &tp.globals {
             let init = self.gen_expr(&g.init, Ctx::Normal);
             out.push_str(&format!("    g_{} = {};\n", g.name, init));
+        }
+        if self.gc {
+            for g in &tp.globals {
+                out.push_str(&format!("    ax_root_global(&g_{});\n", g.name));
+            }
+            out.push_str("    ax_gc_enable();\n");
         }
         out.push_str("    axf_main();\n    return 0;\n}\n");
         out
@@ -203,6 +222,7 @@ impl<'a> CodeGen<'a> {
 
     fn gen_fn(&mut self, f: &TFn) -> String {
         self.scopes.clear();
+        self.scope_roots.clear();
         let mut param_scope = HashSet::new();
         let mut params = Vec::new();
         for (pname, _) in &f.params {
@@ -210,6 +230,7 @@ impl<'a> CodeGen<'a> {
             params.push(format!("AxVal v_{}", pname));
         }
         self.scopes.push(param_scope);
+        self.scope_roots.push(0);
         let mut out = String::new();
         out.push_str(&format!(
             "{}AxVal axf_{}({}) {{\n",
@@ -218,6 +239,13 @@ impl<'a> CodeGen<'a> {
             if params.is_empty() { "void".to_string() } else { params.join(", ") }
         ));
         out.push_str("    AxVal __result = ax_void();\n");
+        if self.gc {
+            // Parameters are roots for the whole call: contract
+            // clauses and callees may trigger collection.
+            for (pname, _) in &f.params {
+                out.push_str(&format!("    ax_root_push(&v_{});\n", pname));
+            }
+        }
         // requires
         for c in &f.contracts {
             if c.kind == ContractKind::Requires {
@@ -245,6 +273,13 @@ impl<'a> CodeGen<'a> {
         for stmt in &f.body {
             out.push_str(&self.gen_stmt(stmt, 1));
         }
+        if self.gc && self.scope_roots[0] > 0 {
+            // Fall-through path: body-level lets leave the root
+            // stack here. Return statements pop them themselves
+            // and jump over this line. Ensures clauses see only
+            // parameters and result, so this is safe.
+            out.push_str(&format!("    ax_root_pop({});\n", self.scope_roots[0]));
+        }
         out.push_str("    __epilogue: ;\n");
         for c in &f.contracts {
             if c.kind == ContractKind::Ensures {
@@ -259,28 +294,56 @@ impl<'a> CodeGen<'a> {
                 ));
             }
         }
+        if self.gc && !f.params.is_empty() {
+            out.push_str(&format!("    ax_root_pop({});\n", f.params.len()));
+        }
         out.push_str("    return __result;\n}\n");
         self.scopes.pop();
+        self.scope_roots.pop();
         out
     }
 
     fn gen_block(&mut self, stmts: &[TStmt], indent: usize) -> String {
         self.scopes.push(HashSet::new());
+        self.scope_roots.push(0);
         let mut out = String::new();
         for s in stmts {
             out.push_str(&self.gen_stmt(s, indent));
         }
+        let n = self.scope_roots.pop().unwrap_or(0);
         self.scopes.pop();
+        if self.gc && n > 0 {
+            out.push_str(&format!("{}ax_root_pop({});\n", "    ".repeat(indent), n));
+        }
         out
     }
 
     fn gen_stmt(&mut self, stmt: &TStmt, indent: usize) -> String {
         let pad = "    ".repeat(indent);
-        match stmt {
+        // GC: collection may only run here, at a statement
+        // boundary, where every live value is reachable from
+        // globals, the root stack, or this statement's temp
+        // roots. root_sum / loop_pop are the root-stack pops the
+        // control-flow statements must emit before jumping.
+        let tm = if self.gc { Some(self.fresh()) } else { None };
+        let root_sum: usize = self.scope_roots.iter().sum();
+        let loop_pop: usize = match self.loop_marks.last() {
+            Some(&m) => self.scope_roots[m..].iter().sum(),
+            None => 0,
+        };
+        let core = match stmt {
             TStmt::Let(name, init) => {
                 let e = self.gen_expr(init, Ctx::Normal);
                 self.scopes.last_mut().unwrap().insert(name.clone());
-                format!("{}AxVal v_{} = {};\n", pad, name, e)
+                if self.gc {
+                    *self.scope_roots.last_mut().unwrap() += 1;
+                    format!(
+                        "{}AxVal v_{} = {};\n{}ax_root_push(&v_{});\n",
+                        pad, name, e, pad, name
+                    )
+                } else {
+                    format!("{}AxVal v_{} = {};\n", pad, name, e)
+                }
             }
             TStmt::Assign(name, value) => {
                 let v = self.gen_expr(value, Ctx::Normal);
@@ -338,7 +401,9 @@ impl<'a> CodeGen<'a> {
             TStmt::While(cond, body) => {
                 let c = self.gen_expr(cond, Ctx::Normal);
                 let mut out = format!("{}while (ax_truth({})) {{\n", pad, c);
+                self.loop_marks.push(self.scopes.len());
                 out.push_str(&self.gen_block(body, indent + 1));
+                self.loop_marks.pop();
                 out.push_str(&format!("{}}}\n", pad));
                 out
             }
@@ -351,30 +416,119 @@ impl<'a> CodeGen<'a> {
                 };
                 let n = self.fresh();
                 let mut out = format!(
-                    "{}{{ AxVal __arr{n} = {it}; int64_t __n{n} = ax_len(__arr{n}); for (int64_t __i{n} = 0; __i{n} < __n{n}; __i{n}++) {{\n",
+                    "{}{{ AxVal __arr{n} = {it};",
                     pad, n = n, it = it
                 );
+                if self.gc {
+                    // The iterated array may be a fresh value
+                    // referenced by nothing else; root it for the
+                    // whole loop. Break jumps land before the pop
+                    // after the loop, so this stays balanced.
+                    out.push_str(&format!(" ax_root_push(&__arr{});", n));
+                }
+                out.push_str(&format!(
+                    " int64_t __n{n} = ax_len(__arr{n}); for (int64_t __i{n} = 0; __i{n} < __n{n}; __i{n}++) {{\n",
+                    n = n
+                ));
                 self.scopes.push(HashSet::from([var.clone()]));
+                self.scope_roots.push(1);
+                self.loop_marks.push(self.scopes.len() - 1);
                 out.push_str(&format!(
                     "{}    AxVal v_{} = ax_arr_get(__arr{}, __i{});\n",
                     pad, var, n, n
                 ));
+                if self.gc {
+                    out.push_str(&format!("{}    ax_root_push(&v_{});\n", pad, var));
+                }
                 for s in body {
                     out.push_str(&self.gen_stmt(s, indent + 1));
                 }
+                self.loop_marks.pop();
+                let k = self.scope_roots.pop().unwrap_or(0);
                 self.scopes.pop();
-                out.push_str(&format!("{}}} }}\n", pad));
+                if self.gc {
+                    if k > 0 {
+                        out.push_str(&format!(
+                            "{}    ax_root_pop({});\n",
+                            pad, k
+                        ));
+                    }
+                    out.push_str(&format!("{}}}\n", pad));
+                    out.push_str(&format!("{}    ax_root_pop(1);\n", pad));
+                    out.push_str(&format!("{}}}\n", pad));
+                } else {
+                    out.push_str(&format!("{}}} }}\n", pad));
+                }
                 out
             }
             TStmt::Return(value) => match value {
                 Some(e) => {
                     let v = self.gen_expr(e, Ctx::Normal);
-                    format!("{}{{ __result = {}; goto __epilogue; }}\n", pad, v)
+                    if self.gc {
+                        format!(
+                            "{}{{ __result = {}; ax_temp_pop(__tm{});{} goto __epilogue; }}\n",
+                            pad,
+                            v,
+                            tm.unwrap(),
+                            if root_sum > 0 {
+                                format!(" ax_root_pop({});", root_sum)
+                            } else {
+                                String::new()
+                            }
+                        )
+                    } else {
+                        format!("{}{{ __result = {}; goto __epilogue; }}\n", pad, v)
+                    }
                 }
-                None => format!("{}goto __epilogue;\n", pad),
+                None => {
+                    if self.gc {
+                        format!(
+                            "{}ax_temp_pop(__tm{});{} goto __epilogue;\n",
+                            pad,
+                            tm.unwrap(),
+                            if root_sum > 0 {
+                                format!(" ax_root_pop({});", root_sum)
+                            } else {
+                                String::new()
+                            }
+                        )
+                    } else {
+                        format!("{}goto __epilogue;\n", pad)
+                    }
+                }
             },
-            TStmt::Break => format!("{}break;\n", pad),
-            TStmt::Continue => format!("{}continue;\n", pad),
+            TStmt::Break => {
+                if self.gc {
+                    format!(
+                        "{}ax_temp_pop(__tm{});{} break;\n",
+                        pad,
+                        tm.unwrap(),
+                        if loop_pop > 0 {
+                            format!(" ax_root_pop({});", loop_pop)
+                        } else {
+                            String::new()
+                        }
+                    )
+                } else {
+                    format!("{}break;\n", pad)
+                }
+            }
+            TStmt::Continue => {
+                if self.gc {
+                    format!(
+                        "{}ax_temp_pop(__tm{});{} continue;\n",
+                        pad,
+                        tm.unwrap(),
+                        if loop_pop > 0 {
+                            format!(" ax_root_pop({});", loop_pop)
+                        } else {
+                            String::new()
+                        }
+                    )
+                } else {
+                    format!("{}continue;\n", pad)
+                }
+            }
             TStmt::Check(expr, text, file, line) => {
                 let e = self.gen_expr(expr, Ctx::Normal);
                 format!(
@@ -390,6 +544,23 @@ impl<'a> CodeGen<'a> {
                 let v = self.gen_expr(e, Ctx::Normal);
                 format!("{}{};\n", pad, v)
             }
+        };
+        match tm {
+            Some(t) => {
+                let mut out = format!(
+                    "{}ax_gc_maybe();\n{}long __tm{} = ax_temp_mark();\n",
+                    pad, pad, t
+                );
+                out.push_str(&core);
+                // Return/Break/Continue emit their own temp pop
+                // before jumping; all other statements pop here,
+                // once the statement has fully executed.
+                if !matches!(stmt, TStmt::Return(_) | TStmt::Break | TStmt::Continue) {
+                    out.push_str(&format!("{}ax_temp_pop(__tm{});\n", pad, t));
+                }
+                out
+            }
+            None => core,
         }
     }
 
@@ -409,6 +580,9 @@ impl<'a> CodeGen<'a> {
             TExprKind::Array(elems) => {
                 let n = self.fresh();
                 let mut out = format!("({{ AxVal __t{} = ax_arr_new();", n);
+                if self.gc && ctx == Ctx::Normal {
+                    out.push_str(&format!(" ax_temp_push(&__t{});", n));
+                }
                 for el in elems {
                     let v = self.gen_expr(el, ctx);
                     out.push_str(&format!(" ax_arr_push(__t{}, {});", n, v));
@@ -427,6 +601,9 @@ impl<'a> CodeGen<'a> {
                     id,
                     nfields
                 );
+                if self.gc && ctx == Ctx::Normal {
+                    out.push_str(&format!(" ax_temp_push(&__t{});", n));
+                }
                 for (idx, fe) in fields {
                     let v = self.gen_expr(fe, ctx);
                     out.push_str(&format!(" ax_obj_set(__t{}, {}, {});", n, idx, v));
@@ -439,11 +616,38 @@ impl<'a> CodeGen<'a> {
                 out
             }
             TExprKind::Call(name, args) => {
-                let mut parts = Vec::new();
-                for a in args {
-                    parts.push(self.gen_expr(a, ctx));
+                if self.gc && ctx == Ctx::Normal {
+                    // Root each argument as soon as it is
+                    // evaluated and root the result: the callee's
+                    // statements may collect, and sibling
+                    // subexpressions run after this call returns.
+                    let base = self.fresh();
+                    let mut out = String::from("({ ");
+                    let mut names = Vec::new();
+                    for (i, a) in args.iter().enumerate() {
+                        let s = self.gen_expr(a, ctx);
+                        out.push_str(&format!(
+                            "AxVal __a{}_{} = {}; ax_temp_push(&__a{}_{}); ",
+                            base, i, s, base, i
+                        ));
+                        names.push(format!("__a{}_{}", base, i));
+                    }
+                    out.push_str(&format!(
+                        "AxVal __r{} = axf_{}({}); ax_temp_push(&__r{}); __r{}; }})",
+                        base,
+                        name,
+                        names.join(", "),
+                        base,
+                        base
+                    ));
+                    out
+                } else {
+                    let mut parts = Vec::new();
+                    for a in args {
+                        parts.push(self.gen_expr(a, ctx));
+                    }
+                    format!("axf_{}({})", name, parts.join(", "))
                 }
-                format!("axf_{}({})", name, parts.join(", "))
             }
             TExprKind::Builtin(name, args) => {
                 let mut parts = Vec::new();
@@ -476,6 +680,7 @@ impl<'a> CodeGen<'a> {
                     "index_of" => format!("ax_int(ax_index_of({}, {}))", parts[0], parts[1]),
                     "starts_with" => format!("ax_bool(ax_starts_with({}, {}))", parts[0], parts[1]),
                     "raise" => format!("({{ ax_raise({}); ax_void(); }})", parts[0]),
+                    "gc_collect" => "ax_gc_collect_builtin()".to_string(),
                     _ => "ax_void()".to_string(),
                 }
             }
@@ -495,6 +700,9 @@ impl<'a> CodeGen<'a> {
             TExprKind::MapLit(pairs) => {
                 let n = self.fresh();
                 let mut out = format!("({{ AxVal __t{} = ax_map_new();", n);
+                if self.gc && ctx == Ctx::Normal {
+                    out.push_str(&format!(" ax_temp_push(&__t{});", n));
+                }
                 for (ke, ve) in pairs {
                     let k = self.gen_expr(ke, ctx);
                     let v = self.gen_expr(ve, ctx);
@@ -507,7 +715,7 @@ impl<'a> CodeGen<'a> {
             TExprKind::Bin(op, l, r) => {
                 let lv = self.gen_expr(l, ctx);
                 let rv = self.gen_expr(r, ctx);
-                match op {
+                let inner = match op {
                     BinOp::Add => format!("ax_add({}, {})", lv, rv),
                     BinOp::Sub => format!("ax_sub({}, {})", lv, rv),
                     BinOp::Mul => format!("ax_mul({}, {})", lv, rv),
@@ -521,6 +729,24 @@ impl<'a> CodeGen<'a> {
                     BinOp::Ge => format!("ax_ge({}, {})", lv, rv),
                     BinOp::And => format!("ax_bool(({}.u.b) && ({}.u.b))", lv, rv),
                     BinOp::Or => format!("ax_bool(({}.u.b) || ({}.u.b))", lv, rv),
+                };
+                if self.gc
+                    && ctx == Ctx::Normal
+                    && matches!(
+                        e.ty,
+                        Type::Str | Type::Array(_) | Type::Map(_, _) | Type::Struct(_)
+                    )
+                {
+                    // A fresh heap result can sit in this
+                    // expression while a later sibling call
+                    // collects; root it until the statement ends.
+                    let n = self.fresh();
+                    format!(
+                        "({{ AxVal __b{} = {}; ax_temp_push(&__b{}); __b{}; }})",
+                        n, inner, n, n
+                    )
+                } else {
+                    inner
                 }
             }
             TExprKind::Un(op, e) => {

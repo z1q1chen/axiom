@@ -184,7 +184,7 @@ pub struct TProgram {
 
 const BUILTINS: &[&str] = &[
     "print", "len", "push", "range", "str", "int", "float", "raise", "has", "keys", "del",
-    "split", "join", "replace", "substr", "index_of", "starts_with",
+    "split", "join", "replace", "substr", "index_of", "starts_with", "gc_collect",
 ];
 
 struct FnSig {
@@ -1705,6 +1705,12 @@ impl Checker {
                     targs.push(self.check_expr(a, None)?);
                 }
                 Ok(te(TExprKind::Builtin(name.into(), targs), Type::Void))
+            }
+            "gc_collect" => {
+                if !args.is_empty() {
+                    return Err(arity("0", args.len()));
+                }
+                Ok(te(TExprKind::Builtin(name.into(), vec![]), Type::Int))
             }
             "len" => {
                 if args.len() != 1 {

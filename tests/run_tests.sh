@@ -93,6 +93,28 @@ else
 fi
 rm -f /tmp/rockstore_test.db
 
+# GC stress: constant collection (threshold 50) while a
+# persistent structure must survive; live blocks stay bounded.
+gc_out="$(AXIOM_GC_THRESHOLD=50 $AX run tests/gc_stress.ax --gc 2>/dev/null)"
+live="$(printf '%s' "$gc_out" | head -1)"
+if printf '%s' "$gc_out" | grep -q "GC STRESS OK" && [ "$live" -lt 1000 ] 2>/dev/null; then
+    echo "PASS gcstress (live=$live)"
+else
+    echo "FAIL gcstress:"
+    printf '%s\n' "$gc_out"
+    fail=1
+fi
+
+# The billing system under aggressive GC must close identically.
+gcb_out="$(AXIOM_GC_THRESHOLD=30 $AX run examples/billing/main.ax --gc 2>/dev/null)"
+if printf '%s' "$gcb_out" | grep -q "ALL CLOSING BALANCES MATCH"; then
+    echo "PASS gcbilling"
+else
+    echo "FAIL gcbilling:"
+    printf '%s\n' "$gcb_out" | tail -5
+    fail=1
+fi
+
 # Separate compilation: the billing system split per module,
 # compiled to objects, linked, and run.
 rm -rf /tmp/axsep && mkdir -p /tmp/axsep

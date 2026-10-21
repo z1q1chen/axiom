@@ -203,8 +203,29 @@ type still rechecks everything even though only changed
 modules need their C recompiled (the driver currently rebuilds
 all objects; it does not do make-style staleness).
 
+## Garbage collection (v0.9)
+
+`axiomc build/run --gc` enables a mark-sweep collector
+(opt-in; the default build keeps the arena behavior). Every
+allocation carries a kind tag (bytes / value buffer / array /
+object / map) so marking traverses containers precisely, and
+value buffers are zero-initialized so spare capacity never
+looks like a pointer. Collection runs only at generated
+statement boundaries, where no unrooted expression temporary
+can be live: parameters and locals sit on a shadow root stack,
+statement intermediates on a temp root stack that the generated
+code maintains, and globals are registered once from the entry
+point. `gc_collect()` forces a collection and returns the live
+block count (a no-op returning -1 in non-GC builds, so it can
+never free live memory there). The threshold defaults to
+10,000 allocations and is tunable via `AXIOM_GC_THRESHOLD`.
+The marker recurses over data nesting, so pathologically deep
+structures could exhaust the C stack; demo-scale data is fine.
+Not yet supported: `--gc` together with `--separate` (each
+separately compiled module carries its own runtime state), and
+collection inside `axiomc verify` harnesses.
+
 ## Roadmap (not in v0.1)
 
 - Proof for a tiny critical core (the tier above bounded).
-- Freeing memory (a real allocator policy).
 - Trait bounds for generic parameters; generic methods.

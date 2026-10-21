@@ -1,0 +1,57 @@
+// GC stress: churn garbage in nested calls while a persistent
+// structure must survive every collection. Run with --gc and a
+// tiny AXIOM_GC_THRESHOLD so collections fire constantly.
+
+fn churn(n: int) -> string {
+    let s = "";
+    let i = 0;
+    while i < n {
+        s = s + "x";
+        let junk = [i, i + 1, i + 2];
+        let m: {int: string} = {i: s};
+        i = i + 1;
+    }
+    return s;
+}
+
+fn make(i: int) -> {int: string} {
+    let m: {int: string} = {i: churn(20)};
+    return m;
+}
+
+fn main() {
+    let keep: {int: string} = {};
+    let i = 0;
+    while i < 50 {
+        let part = make(i);
+        keep[i] = part[i];
+        i = i + 1;
+    }
+    check len(keep) == 50;
+    check len(keep[0]) == 20;
+    check len(keep[49]) == 20;
+
+    // A fresh array iterated by for: the iterator root case,
+    // with break and continue crossing collections.
+    let total = 0;
+    for x in [1, 2, 3, 4, 5, 6, 7, 8] {
+        let pad = churn(5);
+        if x == 3 {
+            continue;
+        }
+        if x == 7 {
+            break;
+        }
+        total = total + x;
+    }
+    check total == 18;
+
+    // Deep-ish nesting that must stay reachable through a call.
+    let nested = [[churn(3), churn(4)], [churn(5)]];
+    check len(nested[0][1]) == 4;
+    check len(nested[1][0]) == 5;
+
+    let live = gc_collect();
+    print(live);
+    print("GC STRESS OK");
+}

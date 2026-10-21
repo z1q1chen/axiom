@@ -13,13 +13,16 @@ program, and records every one of them in a **verification ledger**.
 
 ## Status
 
-v0.8, built 2026-10-21. A working language, not the full design
+v0.9, built 2026-10-21. A working language, not the full design
 proposal: the proof tier is on the roadmap in `DESIGN.md`, not in
 this build. Contracts are runtime-checked (bound for externs,
 bounded where `axiomc verify` has exhausted a domain), and the
 ledger and verify report say exactly that.
 
-v0.8 adds separate compilation (`axiomc build --separate`): one
+v0.9 adds an opt-in garbage collector (`--gc`): precise
+mark-sweep over kind-tagged allocations, rooted by generated
+shadow stacks, collecting only at statement boundaries. v0.8
+added separate compilation (`axiomc build --separate`): one
 C file and object per Axiom source file, linked through a
 generated header. v0.6 added `axiomc verify`: bounded exhaustive checking of pure
 int/bool functions, with counterexamples and a verify report at
